@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // Use modules
-use galatea::{embedder, hoarder, parser_mod, processing, wanderer};
+use galatea::{embedder, hoarder, parser_mod, processing, wanderer, editor};
 
 // Add Poem imports
 use poem::{
@@ -14,6 +16,7 @@ use poem::{
     web::Json, 
     EndpointExt, Route, Server,
     http::Method,
+    web::Data,
 };
 use serde::{Deserialize, Serialize};
 
@@ -195,6 +198,27 @@ struct BuildIndexRequest {
     api_key: Option<String>,
     api_base: Option<String>,
     collection_name: String,
+}
+
+// Editor API Request Structure
+#[derive(Debug, Serialize, Deserialize)]
+struct EditorCommandRequest {
+    command: String, // "view", "create", "str_replace", "insert", "undo_edit"
+    path: String,    // Required by schema, value might be ignored for 'undo_edit'
+    file_text: Option<String>,
+    insert_line: Option<usize>, // 1-indexed
+    new_str: Option<String>,
+    old_str: Option<String>,
+    view_range: Option<Vec<isize>>, // [start_line, end_line], 1-indexed, end_line = -1 for to_end
+}
+
+// Editor API Response Structure
+#[derive(Debug, Serialize, Deserialize)]
+struct EditorCommandResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>, // For view command
 }
 
 #[handler]
@@ -506,7 +530,53 @@ async fn build_index_api(Json(req): Json<BuildIndexRequest>) -> Result<Json<Gene
     }))
 }
 
+#[handler]
+async fn editor_command_api(
+    editor_data: Data<&Arc<Mutex<editor::Editor>>>,
+    Json(req): Json<EditorCommandRequest>,
+) -> Result<Json<EditorCommandResponse>, poem::Error> {
+    let command_type = match req.command.as_str() {
+        "view" => editor::CommandType::View,
+        "create" => editor::CommandType::Create,
+        "str_replace" => editor::CommandType::StrReplace,
+        "insert" => editor::CommandType::Insert,
+        "undo_edit" => editor::CommandType::UndoEdit,
+        _ => {
+            return Err(poem::Error::from_string(
+                format!("Invalid command type: {}", req.command),
+                poem::http::StatusCode::BAD_REQUEST,
+            ))
+        }
+    };
+
+    // Path is required by EditorArgs and API schema
+    let editor_args = editor::EditorArgs {
+        command: command_type,
+        path: req.path.clone(), // path is always required by schema
+        file_text: req.file_text.clone(),
+        insert_line: req.insert_line,
+        new_str: req.new_str.clone(),
+        old_str: req.old_str.clone(),
+        view_range: req.view_range.clone(),
+    };
+
+    let mut editor_guard = editor_data.0.lock().await;
+    match editor::handle_command(&mut editor_guard, editor_args) {
+        Ok(Some(content)) => Ok(Json(EditorCommandResponse {
+            message: None,
+            content: Some(content),
+        })),
+        Ok(None) => Ok(Json(EditorCommandResponse {
+            message: Some(format!("Command '{}' executed successfully.", req.command)),
+            content: None,
+        })),
+        Err(e) => Err(poem::Error::from_string(e, poem::http::StatusCode::BAD_REQUEST)),
+    }
+}
+
 async fn start_server(host: String, port: u16) -> Result<()> {
+    let editor_state = Arc::new(Mutex::new(editor::Editor::new()));
+
     let api_app = Route::new()
         .at("/health", get(health))
         .at("/find-files", post(find_files))
@@ -516,6 +586,7 @@ async fn start_server(host: String, port: u16) -> Result<()> {
         .at("/generate-embeddings", post(generate_embeddings_api))
         .at("/upsert-embeddings", post(upsert_embeddings_api))
         .at("/build-index", post(build_index_api))
+        .at("/editor", post(editor_command_api))
         .with(Cors::new()
             .allow_credentials(true)
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -535,7 +606,7 @@ async fn start_server(host: String, port: u16) -> Result<()> {
     println!("Starting Galatea server on {}:{}", host, port);
     println!("Serving API at /api and static files from ./dist at / ");
     Server::new(TcpListener::bind(format!("{}:{}", host, port)))
-        .run(app)
+        .run(app.data(editor_state))
         .await
         .map_err(|e| anyhow::anyhow!("Server error: {}", e))
 }

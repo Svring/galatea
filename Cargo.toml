@@ -28,10 +28,6 @@ uuid = {version = "1.6", features = ["v4"]}
 wasm-bindgen = "0.2.89"
 web-sys = { version = "0.3.66", features = ["Document", "Element", "HtmlElement", "Node", "Window", "Text"] }
 
-# [[bin]]
-# name = "frontend"
-# path = "src/app_leptos.rs"
-
 [dev-dependencies]
 tempfile = "3.10.1"
 

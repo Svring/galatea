@@ -5,3 +5,4 @@ pub mod processing;
 pub mod wanderer;
 pub mod embedder;
 pub mod hoarder;
+pub mod editor;
