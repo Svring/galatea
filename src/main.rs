@@ -72,6 +72,8 @@ enum Commands {
         input_file: PathBuf,
         #[arg(long, required = true)]
         collection_name: String,
+        #[arg(long, default_value = "http://localhost:6334")]
+        qdrant_url: String,
     },
     /// Query a Qdrant collection with a text query
     Query {
@@ -83,6 +85,8 @@ enum Commands {
         api_key: Option<String>,
         #[arg(long)]
         api_base: Option<String>,
+        #[arg(long, default_value = "http://localhost:6334")]
+        qdrant_url: String,
         query_text: String,
     },
     /// Build a full index: Find files -> Parse -> Embed -> Store in Qdrant
@@ -113,6 +117,8 @@ enum Commands {
         // Hoarder args
         #[arg(long, required = true)]
         collection_name: String,
+        #[arg(long, default_value = "http://localhost:6334")]
+        qdrant_url: String,
     },
     /// Start the Galatea web API server
     StartServer {
@@ -158,6 +164,7 @@ struct QueryRequest {
     model: Option<String>,
     api_key: Option<String>,
     api_base: Option<String>,
+    qdrant_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -179,6 +186,7 @@ struct GenericApiResponse {
 struct UpsertEmbeddingsRequest {
     input_file: String,
     collection_name: String,
+    qdrant_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +200,7 @@ struct BuildIndexRequest {
     api_key: Option<String>,
     api_base: Option<String>,
     collection_name: String,
+    qdrant_url: Option<String>,
 }
 
 // Editor API Request Structure
@@ -409,6 +418,7 @@ async fn query_collection(
         "API query request for collection '{}': {}",
         req.collection_name, req.query_text
     );
+    let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
 
     match hoarder::query(
         &req.collection_name,
@@ -416,6 +426,7 @@ async fn query_collection(
         req.model,
         req.api_key,
         req.api_base,
+        qdrant_url,
     )
     .await
     {
@@ -480,6 +491,7 @@ async fn upsert_embeddings_api(
         req.input_file, req.collection_name
     );
     let input_path = PathBuf::from(&req.input_file);
+    let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
 
     if !input_path.exists() {
         return Err(poem::Error::from_string(
@@ -489,7 +501,7 @@ async fn upsert_embeddings_api(
     }
 
     // Ensure collection exists (optional, create_collection is idempotent)
-    if let Err(e) = hoarder::create_collection(&req.collection_name).await {
+    if let Err(e) = hoarder::create_collection(&req.collection_name, qdrant_url).await {
         eprintln!(
             "Error creating collection '{}' (it might already exist or Qdrant is down): {}",
             req.collection_name, e
@@ -498,7 +510,7 @@ async fn upsert_embeddings_api(
         // For now, let's proceed, as upsert will fail if collection doesn't exist and couldn't be created.
     }
 
-    match hoarder::upsert_embeddings(&req.collection_name, &input_path).await {
+    match hoarder::upsert_embeddings(&req.collection_name, &input_path, qdrant_url).await {
         Ok(_) => Ok(Json(GenericApiResponse {
             message: "Embeddings upserted successfully.".to_string(),
             details: Some(format!(
@@ -524,6 +536,10 @@ async fn build_index_api(
         "API request to build index: dir='{}', collection='{}'",
         req.dir, req.collection_name
     );
+    let qdrant_url_for_spawn = req
+        .qdrant_url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:6334".to_string());
 
     // Clone all necessary data from req to move into the spawned task
     let dir_clone = req.dir.clone();
@@ -539,6 +555,7 @@ async fn build_index_api(
     // For long-running tasks like this, it's better to spawn a new task
     // so the HTTP request can return quickly.
     tokio::spawn(async move {
+        let qdrant_url_inner = qdrant_url_for_spawn; // Use the URL captured for the spawn
         let dir_path = PathBuf::from(dir_clone); // Use cloned data
         let suffixes_ref: Vec<&str> = suffixes_clone.iter().map(|s| s.as_str()).collect();
 
@@ -653,7 +670,8 @@ async fn build_index_api(
             "[4/4] Storing embeddings in Qdrant collection '{}'...",
             collection_name_clone
         ); // Use cloned data
-        if let Err(e) = hoarder::create_collection(&collection_name_clone).await {
+        if let Err(e) = hoarder::create_collection(&collection_name_clone, &qdrant_url_inner).await
+        {
             // Use cloned data
             eprintln!(
                 "BuildIndex API: Failed to ensure Qdrant collection exists: {}",
@@ -661,9 +679,12 @@ async fn build_index_api(
             );
             return;
         }
-        if let Err(e) =
-            hoarder::upsert_entities_from_vec(&collection_name_clone, entities_with_embeddings)
-                .await
+        if let Err(e) = hoarder::upsert_entities_from_vec(
+            &collection_name_clone,
+            entities_with_embeddings,
+            &qdrant_url_inner,
+        )
+        .await
         {
             // Use cloned data
             eprintln!(
@@ -799,7 +820,11 @@ async fn lsp_goto_definition_api(
         Ok(content) => content,
         Err(e) => {
             return Err(poem::Error::from_string(
-                format!("Failed to read file for LSP didOpen '{}': {}", file_path.display(), e),
+                format!(
+                    "Failed to read file for LSP didOpen '{}': {}",
+                    file_path.display(),
+                    e
+                ),
                 poem::http::StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
@@ -814,17 +839,20 @@ async fn lsp_goto_definition_api(
 
     // Notify didOpen before gotoDefinition
     // Determine language ID based on extension - simplistic, could be improved
-    let language_id = file_path.extension().and_then(|ext| ext.to_str()).map_or_else(
-        || "plaintext".to_string(), // Default if no extension
-        |ext| match ext {
-            "ts" => "typescript".to_string(),
-            "tsx" => "typescriptreact".to_string(),
-            "js" => "javascript".to_string(),
-            "jsx" => "javascriptreact".to_string(),
-            "json" => "json".to_string(),
-            _ => "plaintext".to_string(),
-        },
-    );
+    let language_id = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map_or_else(
+            || "plaintext".to_string(), // Default if no extension
+            |ext| match ext {
+                "ts" => "typescript".to_string(),
+                "tsx" => "typescriptreact".to_string(),
+                "js" => "javascript".to_string(),
+                "jsx" => "javascriptreact".to_string(),
+                "json" => "json".to_string(),
+                _ => "plaintext".to_string(),
+            },
+        );
 
     if let Err(e) = client_guard
         .notify_did_open(file_uri.clone(), &language_id, 0, file_content)
@@ -832,7 +860,10 @@ async fn lsp_goto_definition_api(
     {
         // Log this error but proceed to goto_definition anyway, as some servers might allow it
         // or the file might have been opened by another means.
-        eprintln!("LSP notify_did_open failed (continuing to goto_definition): {}", e);
+        eprintln!(
+            "LSP notify_did_open failed (continuing to goto_definition): {}",
+            e
+        );
     }
 
     match client_guard.goto_definition(file_uri, position).await {
@@ -1078,9 +1109,12 @@ async fn main() -> Result<()> {
             Commands::UpsertEmbeddings {
                 input_file,
                 collection_name,
+                qdrant_url,
             } => {
-                hoarder::create_collection(&collection_name).await?;
-                if let Err(e) = hoarder::upsert_embeddings(&collection_name, &input_file).await {
+                hoarder::create_collection(&collection_name, &qdrant_url).await?;
+                if let Err(e) =
+                    hoarder::upsert_embeddings(&collection_name, &input_file, &qdrant_url).await
+                {
                     eprintln!("Failed to upsert embeddings from file: {}", e);
                     return Err(e);
                 }
@@ -1092,13 +1126,21 @@ async fn main() -> Result<()> {
                 model,
                 api_key,
                 api_base,
+                qdrant_url,
             } => {
                 println!(
-                    "Querying collection '{}' with: \"{}\"",
-                    collection_name, query_text
+                    "Querying collection '{}' with: \"{}\" using Qdrant at {}",
+                    collection_name, query_text, qdrant_url
                 );
-                if let Err(e) =
-                    hoarder::query(&collection_name, &query_text, model, api_key, api_base).await
+                if let Err(e) = hoarder::query(
+                    &collection_name,
+                    &query_text,
+                    model,
+                    api_key,
+                    api_base,
+                    &qdrant_url,
+                )
+                .await
                 {
                     eprintln!("Failed to execute query: {}", e);
                     return Err(e);
@@ -1114,8 +1156,12 @@ async fn main() -> Result<()> {
                 api_key,
                 api_base,
                 collection_name,
+                qdrant_url,
             } => {
-                println!("--- Starting Full Index Build ---");
+                println!(
+                    "--- Starting Full Index Build (Qdrant at: {}) ---",
+                    qdrant_url
+                );
 
                 println!("[1/4] Finding files...");
                 let suffixes_ref: Vec<&str> = suffixes.iter().map(|s| s.as_str()).collect();
@@ -1199,12 +1245,16 @@ async fn main() -> Result<()> {
                     "[4/4] Storing embeddings in Qdrant collection '{}'...",
                     collection_name
                 );
-                hoarder::create_collection(&collection_name)
+                hoarder::create_collection(&collection_name, &qdrant_url)
                     .await
                     .context("Failed to ensure Qdrant collection exists")?;
-                hoarder::upsert_entities_from_vec(&collection_name, entities_with_embeddings)
-                    .await
-                    .context("Upserting embeddings to Qdrant failed")?;
+                hoarder::upsert_entities_from_vec(
+                    &collection_name,
+                    entities_with_embeddings,
+                    &qdrant_url,
+                )
+                .await
+                .context("Upserting embeddings to Qdrant failed")?;
 
                 println!("--- Index Build Complete ---");
             }

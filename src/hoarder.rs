@@ -1,8 +1,7 @@
 use crate::parser_mod::structs::CodeEntity;
 use anyhow::{Context, Result};
 use async_openai::{
-    config::OpenAIConfig, types::CreateEmbeddingRequestArgs,
-    Client as OpenAIClient,
+    config::OpenAIConfig, types::CreateEmbeddingRequestArgs, Client as OpenAIClient,
 };
 use qdrant_client::qdrant::{
     vectors_config::Config, CreateCollectionBuilder, Distance, PointStruct, SearchPointsBuilder,
@@ -20,8 +19,8 @@ use uuid::Uuid;
 const EMBEDDING_DIMENSION: u64 = 1536;
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small"; // Use constant from embedder
 
-pub async fn create_collection(collection_name: &str) -> Result<()> {
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
+pub async fn create_collection(collection_name: &str, qdrant_url: &str) -> Result<()> {
+    let client = Qdrant::from_url(qdrant_url).build()?;
 
     // Check if collection already exists (optional, but good practice)
     if client.collection_exists(collection_name).await? {
@@ -55,7 +54,7 @@ async fn upsert_entities_core(
     let mut points_to_upsert = Vec::new();
     println!("Preparing {} entities for upsert...", entities.len());
 
-    for entity in entities { 
+    for entity in entities {
         if let Some(vector) = entity.embedding {
             let payload_value = json!({
                 "name": entity.name,
@@ -65,19 +64,25 @@ async fn upsert_entities_core(
                 "line": entity.line,
                 "line_from": entity.line_from,
                 "line_to": entity.line_to,
-                "context": entity.context 
+                "context": entity.context
             });
             let payload = match Payload::try_from(payload_value) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("Warning: Failed to convert entity '{}' to payload: {}. Skipping.", entity.name, e);
+                    eprintln!(
+                        "Warning: Failed to convert entity '{}' to payload: {}. Skipping.",
+                        entity.name, e
+                    );
                     continue;
                 }
             };
-            let point_id = Uuid::new_v4().to_string(); 
+            let point_id = Uuid::new_v4().to_string();
             points_to_upsert.push(PointStruct::new(point_id, vector, payload));
         } else {
-            println!("Skipping entity '{}' due to missing embedding.", entity.name);
+            println!(
+                "Skipping entity '{}' due to missing embedding.",
+                entity.name
+            );
         }
     }
 
@@ -86,10 +91,15 @@ async fn upsert_entities_core(
         return Ok(());
     }
 
-    println!("Upserting {} points into collection '{}'...", points_to_upsert.len(), collection_name);
-    let response = client // Use passed client reference
-        .upsert_points(UpsertPointsBuilder::new(collection_name, points_to_upsert))
-        .await?;
+    println!(
+        "Upserting {} points into collection '{}'...",
+        points_to_upsert.len(),
+        collection_name
+    );
+    let response =
+        client // Use passed client reference
+            .upsert_points(UpsertPointsBuilder::new(collection_name, points_to_upsert))
+            .await?;
 
     println!("Upsert finished.");
     dbg!(response);
@@ -97,57 +107,60 @@ async fn upsert_entities_core(
 }
 
 // Public function for file-based operation (Original name)
-pub async fn upsert_embeddings(
-    collection_name: &str, 
-    json_file_path: &Path
-) -> Result<()> {
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
+pub async fn upsert_embeddings(collection_name: &str, json_file_path: &Path, qdrant_url: &str) -> Result<()> {
+    let client = Qdrant::from_url(qdrant_url).build()?;
     println!("Reading embeddings from: {}", json_file_path.display());
     let json_content = fs::read_to_string(json_file_path)
         .with_context(|| format!("Failed to read file: {}", json_file_path.display()))?;
     let entities: Vec<CodeEntity> = serde_json::from_str(&json_content)
         .with_context(|| format!("Failed to parse JSON from: {}", json_file_path.display()))?;
-    
+
     // Call core logic
     upsert_entities_core(collection_name, entities, &client).await
 }
 
 // Public function for in-memory operation
 pub async fn upsert_entities_from_vec(
-    collection_name: &str, 
-    entities: Vec<CodeEntity>
+    collection_name: &str,
+    entities: Vec<CodeEntity>,
+    qdrant_url: &str,
 ) -> Result<()> {
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
+    let client = Qdrant::from_url(qdrant_url).build()?;
     // Call core logic
     upsert_entities_core(collection_name, entities, &client).await
 }
 
 // Refined query function
 pub async fn query(
-    collection_name: &str, 
+    collection_name: &str,
     query: &str,
     model_name: Option<String>,
     api_key: Option<String>,
     api_base: Option<String>,
+    qdrant_url: &str,
 ) -> Result<Vec<CodeEntity>> {
     // --- OpenAI Client Setup (similar to embedder.rs) ---
     let effective_api_key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
     let effective_api_base = api_base.or_else(|| std::env::var("OPENAI_API_BASE").ok());
-    
+
     let mut config = OpenAIConfig::default();
     // Require API key for querying
-    let key = effective_api_key.context("OpenAI API key not found. Set OPENAI_API_KEY env var or use --api-key.")?;
+    let key = effective_api_key
+        .context("OpenAI API key not found. Set OPENAI_API_KEY env var or use --api-key.")?;
     config = config.with_api_key(key);
-    
+
     if let Some(base) = effective_api_base {
-         config = config.with_api_base(base);
+        config = config.with_api_base(base);
     }
     let openai_client = OpenAIClient::with_config(config);
     let model = model_name.unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
     // --- End OpenAI Client Setup ---
 
-    println!("Generating embedding for query: \"{}\" using model: {}", query, model);
-    
+    println!(
+        "Generating embedding for query: \"{}\" using model: {}",
+        query, model
+    );
+
     // --- Create Embedding Request ---
     let request = CreateEmbeddingRequestArgs::default()
         .model(model)
@@ -156,7 +169,10 @@ pub async fn query(
         .with_context(|| format!("Failed to create embedding request for query: {}", query))?;
 
     // --- Get Embedding (with basic error handling, no retry for now) ---
-    let query_embedding_response = openai_client.embeddings().create(request).await
+    let query_embedding_response = openai_client
+        .embeddings()
+        .create(request)
+        .await
         .with_context(|| format!("OpenAI API call failed for query: {}", query))?;
 
     let query_embedding = query_embedding_response
@@ -167,10 +183,13 @@ pub async fn query(
         .context("No embedding data received from OpenAI API")?;
     println!("Query embedding generated successfully.");
     // --- End Embedding Generation ---
-    
+
     // --- Qdrant Client and Search ---
-    println!("Connecting to Qdrant and searching collection '{}'...", collection_name);
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
+    println!(
+        "Connecting to Qdrant and searching collection '{}'...",
+        collection_name
+    );
+    let client = Qdrant::from_url(qdrant_url).build()?;
 
     let search_request = SearchPointsBuilder::new(collection_name, query_embedding, 10) // Limit to 10 results for API
         .with_payload(true) // Include payload in results
@@ -186,7 +205,11 @@ pub async fn query(
     if response.result.is_empty() {
         println!("No results found for query: '{}'", query);
     } else {
-        println!("Found {} results for query: '{}'", response.result.len(), query);
+        println!(
+            "Found {} results for query: '{}'",
+            response.result.len(),
+            query
+        );
         for point in response.result {
             // Convert payload to JSON value using serde_json
             match serde_json::to_value(&point.payload) {
@@ -201,12 +224,18 @@ pub async fn query(
                             entities.push(entity);
                         }
                         Err(e) => {
-                            eprintln!("Failed to deserialize payload to CodeEntity: {}. Payload: {}", e, json_value);
+                            eprintln!(
+                                "Failed to deserialize payload to CodeEntity: {}. Payload: {}",
+                                e, json_value
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to convert Qdrant payload to JSON value: {}. Payload: {:?}", e, point.payload);
+                    eprintln!(
+                        "Failed to convert Qdrant payload to JSON value: {}. Payload: {:?}",
+                        e, point.payload
+                    );
                 }
             }
         }

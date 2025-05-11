@@ -8,8 +8,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use jsonrpc_lite::{Id, JsonRpc, Params};
-use lsp_types::notification::{DidOpenTextDocument, Exit, Notification as LspNotificationTrait};
-use lsp_types::request::{GotoDefinition, Initialize, Request as LspRequestTrait, Shutdown};
+use lsp_types::notification::Notification as LspNotificationTrait;
+use lsp_types::request::Request as LspRequestTrait;
 use lsp_types::{
     ClientCapabilities, DidOpenTextDocumentParams, GotoDefinitionParams, InitializeParams,
     PartialResultParams, Position, TextDocumentIdentifier, TextDocumentItem,

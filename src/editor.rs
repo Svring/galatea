@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::{self, Write}; // BufRead, BufReader removed as direct usage replaced by lines() and read_to_string
 use std::path::{Path, PathBuf};
 
 // Enum to represent the type of the last operation for undo functionality
