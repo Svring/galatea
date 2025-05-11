@@ -9,6 +9,7 @@ async-openai = "0.28.1"
 backoff = {version = "0.4", features = ["tokio"]}
 clap = {version = "4.5.37", features = ["derive"]}
 console_error_panic_hook = "0.1.7"
+fluent-uri = "0.3.2"
 futures = "0.3"
 http = "0.2"
 jsonrpc-lite = "0.6.0"

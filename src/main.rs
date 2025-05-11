@@ -784,12 +784,57 @@ async fn lsp_goto_definition_api(
         }
     };
 
+    let mut file_path_str = file_uri.path().to_string(); // Convert URI path component to String
+    #[cfg(windows)]
+    {
+        // On Windows, Uri path might start with a leading `/` for a path like `C:\...`,
+        // e.g., `/c:/Users/...`. We need to strip it if present for PathBuf.
+        if file_path_str.starts_with('/') && file_path_str.chars().nth(2) == Some(':') {
+            file_path_str = file_path_str[1..].to_string();
+        }
+    }
+    let file_path = PathBuf::from(file_path_str);
+
+    let file_content = match std::fs::read_to_string(&file_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return Err(poem::Error::from_string(
+                format!("Failed to read file for LSP didOpen '{}': {}", file_path.display(), e),
+                poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    };
+
     let position = lsp_types::Position {
         line: req.line,
         character: req.character,
     };
 
     let mut client_guard = lsp_client_data.0.lock().await;
+
+    // Notify didOpen before gotoDefinition
+    // Determine language ID based on extension - simplistic, could be improved
+    let language_id = file_path.extension().and_then(|ext| ext.to_str()).map_or_else(
+        || "plaintext".to_string(), // Default if no extension
+        |ext| match ext {
+            "ts" => "typescript".to_string(),
+            "tsx" => "typescriptreact".to_string(),
+            "js" => "javascript".to_string(),
+            "jsx" => "javascriptreact".to_string(),
+            "json" => "json".to_string(),
+            _ => "plaintext".to_string(),
+        },
+    );
+
+    if let Err(e) = client_guard
+        .notify_did_open(file_uri.clone(), &language_id, 0, file_content)
+        .await
+    {
+        // Log this error but proceed to goto_definition anyway, as some servers might allow it
+        // or the file might have been opened by another means.
+        eprintln!("LSP notify_did_open failed (continuing to goto_definition): {}", e);
+    }
+
     match client_guard.goto_definition(file_uri, position).await {
         Ok(locations) => Ok(Json(GotoDefinitionApiResponse { locations })),
         Err(e) => Err(poem::Error::from_string(

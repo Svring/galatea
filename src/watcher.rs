@@ -13,19 +13,22 @@ use lsp_types::request::{GotoDefinition, Initialize, Request as LspRequestTrait,
 use lsp_types::{
     ClientCapabilities, DidOpenTextDocumentParams, GotoDefinitionParams, InitializeParams,
     PartialResultParams, Position, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams, WorkspaceFolder,
 };
 
 // --- Project and Dependency Management ---
 
 pub fn get_project_root() -> Result<PathBuf, String> {
-    let current_dir =
-        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
-    let project_dir = current_dir.join("project");
+    let mut exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get current executable path: {}", e))?;
+    exe_path.pop(); // Remove the executable filename to get its directory
+
+    let project_dir = exe_path.join("project");
+
     if !project_dir.is_dir() {
         return Err(format!(
-            "'project' subdirectory not found in {}. Please create it and initialize an npm project if needed.",
-            current_dir.display()
+            "'project' subdirectory not found in the executable's directory ({}). Please create it.",
+            exe_path.display()
         ));
     }
     Ok(project_dir)
@@ -308,10 +311,6 @@ pub async fn check_prettier(target_patterns: &[String]) -> Result<Vec<String>, S
                 .map(String::from)
                 .filter(|s| !s.is_empty())
                 .collect();
-            println!(
-                "Prettier --check: Found unformatted files: {:?}",
-                unformatted_files
-            );
             Ok(unformatted_files)
         }
         _ => {
@@ -523,9 +522,7 @@ impl LspClient {
         let msg_json = serde_json::to_string(&rpc)
             .map_err(|e| format!("Failed to serialize LSP RPC: {}", e))?;
         let msg_with_header = format!(
-            "Content-Length: {}
-
-{}",
+            "Content-Length: {}\r\n\r\n{}",
             msg_json.len(),
             msg_json
         );
@@ -541,15 +538,15 @@ impl LspClient {
         Ok(())
     }
 
-    async fn send_request(&mut self, method: &str, _params: Params) -> Result<Id, String> {
+    async fn send_request(&mut self, method: &str, params: Params) -> Result<Id, String> {
         let id = self.next_request_id();
-        let request_obj = JsonRpc::request(id.clone(), method);
+        let request_obj = JsonRpc::request_with_params(id.clone(), method, params);
         self.send_rpc(request_obj).await?;
         Ok(id)
     }
 
-    async fn send_notification(&mut self, method: &str, _params: Params) -> Result<(), String> {
-        let notification_obj = JsonRpc::notification(method);
+    async fn send_notification(&mut self, method: &str, params: Params) -> Result<(), String> {
+        let notification_obj = JsonRpc::notification_with_params(method, params);
         self.send_rpc(notification_obj).await
     }
 
@@ -590,16 +587,31 @@ impl LspClient {
         root_uri: Uri,
         client_capabilities: ClientCapabilities,
     ) -> Result<lsp_types::InitializeResult, String> {
+        let workspace_folder_path = root_uri
+            .path()
+            .to_string();
+        
+        let workspace_folder_name = Path::new(&workspace_folder_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        let workspace_folder = WorkspaceFolder {
+            uri: root_uri.clone(), // Use the provided root_uri
+            name: workspace_folder_name,
+        };
+
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_uri: Some(root_uri),
-            root_path: None,
+            root_uri: Some(root_uri), // This is still technically needed for older LSP versions or specific servers
+            root_path: None, // Deprecated in favor of root_uri and workspace_folders
             initialization_options: None,
             capabilities: client_capabilities,
             trace: None,
-            workspace_folders: None,
+            workspace_folders: Some(vec![workspace_folder]), // Populate workspace_folders
             client_info: None,
-            locale: None,
+            locale: None, // Kept as None, should be valid Option<String>
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let request_id = self
