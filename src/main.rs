@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Use modules
 use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher};
@@ -114,7 +115,7 @@ enum Commands {
         api_key: Option<String>,
         #[arg(long)]
         api_base: Option<String>,
-        // Hoarder args
+         // Hoarder args
         #[arg(long, required = true)]
         collection_name: String,
         #[arg(long, default_value = "http://localhost:6334")]
@@ -178,6 +179,7 @@ struct GenerateEmbeddingsRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GenericApiResponse {
+    success: bool,
     message: String,
     details: Option<String>,
 }
@@ -218,10 +220,21 @@ struct EditorCommandRequest {
 // Editor API Response Structure
 #[derive(Debug, Serialize, Deserialize)]
 struct EditorCommandResponse {
+    success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>, // For view command
+    content: Option<String>, // For view command and now for all file modification operations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_at: Option<String>, // ISO timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_lines: Option<Vec<usize>>, // Line numbers affected
 }
 
 // Watcher API Payloads
@@ -273,9 +286,32 @@ struct GotoDefinitionApiResponse {
     locations: Option<lsp_types::GotoDefinitionResponse>,
 }
 
+// package.json API Response - uses watcher::PackageJsonData directly
+
 #[handler]
 async fn health() -> &'static str {
     "Galatea API is running"
+}
+
+#[handler]
+async fn get_package_json_api() -> Result<Json<watcher::PackageJsonData>, poem::Error> {
+    match watcher::parse_package_json().await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => {
+            // Determine if the error is due to file not found or parsing error for status code
+            if e.contains("package.json not found") {
+                Err(poem::Error::from_string(
+                    format!("Error getting package.json: {}", e),
+                    poem::http::StatusCode::NOT_FOUND, // 404 if not found
+                ))
+            } else {
+                Err(poem::Error::from_string(
+                    format!("Error parsing package.json: {}", e),
+                    poem::http::StatusCode::INTERNAL_SERVER_ERROR, // 500 for other errors like parsing
+                ))
+            }
+        }
+    }
 }
 
 #[handler]
@@ -296,7 +332,7 @@ async fn find_files(
         ]
     });
     let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-
+    
     match wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref) {
         Ok(found_files) => {
             let file_paths = found_files
@@ -317,28 +353,28 @@ async fn parse_file(
     Json(req): Json<ParseFileRequest>,
 ) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
     let file_path = PathBuf::from(&req.file_path);
-
+    
     if !file_path.exists() {
         return Err(poem::Error::from_string(
             format!("File not found: {}", file_path.display()),
             poem::http::StatusCode::NOT_FOUND,
         ));
     }
-
+    
     let extension = file_path
         .extension()
         .and_then(|ext| ext.to_str())
         .ok_or_else(|| {
             poem::Error::from_string("File has no extension", poem::http::StatusCode::BAD_REQUEST)
         })?;
-
+        
     let parse_result = match extension {
         "rs" => parser_mod::extract_rust_entities_from_file(&file_path, req.max_snippet_size),
         "ts" => parser_mod::extract_ts_entities(&file_path, false, req.max_snippet_size),
         "tsx" => parser_mod::extract_ts_entities(&file_path, true, req.max_snippet_size),
         _ => Err(anyhow::anyhow!("Unsupported file extension: {}", extension)),
     };
-
+    
     match parse_result {
         Ok(entities) => Ok(Json(entities)),
         Err(e) => Err(poem::Error::from_string(
@@ -366,28 +402,28 @@ async fn parse_directory(
         ]
     });
     let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-
+    
     let granularity = match req.granularity.as_deref() {
         Some("coarse") => processing::Granularity::Coarse,
         Some("medium") => processing::Granularity::Medium,
         _ => processing::Granularity::Fine,
     };
-
+    
     let files_to_parse =
         match wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref) {
-            Ok(files) => files,
+        Ok(files) => files,
             Err(e) => {
                 return Err(poem::Error::from_string(
-                    format!("Error finding files: {}", e),
+            format!("Error finding files: {}", e),
                     poem::http::StatusCode::INTERNAL_SERVER_ERROR,
-                ))
+        ))
             }
-        };
-
+    };
+    
     if files_to_parse.is_empty() {
         return Ok(Json(Vec::new()));
     }
-
+    
     let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
     for file_path in files_to_parse {
         let extension = file_path.extension().and_then(|ext| ext.to_str());
@@ -399,12 +435,12 @@ async fn parse_directory(
             Some("tsx") => parser_mod::extract_ts_entities(&file_path, true, req.max_snippet_size),
             _ => continue,
         };
-
+        
         if let Ok(entities) = parse_result {
             all_entities.extend(entities);
         }
     }
-
+    
     let final_entities =
         processing::post_process_entities(all_entities, granularity, req.max_snippet_size);
     Ok(Json(final_entities))
@@ -460,15 +496,16 @@ async fn generate_embeddings_api(
     }
 
     match embedder::generate_embeddings_for_index(
-        &input_path,
-        &output_path,
-        req.model,
-        req.api_key,
+        &input_path, 
+        &output_path, 
+        req.model, 
+        req.api_key, 
         req.api_base,
     )
     .await
     {
         Ok(_) => Ok(Json(GenericApiResponse {
+            success: true,
             message: "Embeddings generated successfully.".to_string(),
             details: Some(format!("Output written to {}", req.output_file)),
         })),
@@ -487,7 +524,7 @@ async fn upsert_embeddings_api(
     Json(req): Json<UpsertEmbeddingsRequest>,
 ) -> Result<Json<GenericApiResponse>, poem::Error> {
     println!(
-        "API request to upsert embeddings: input='{}', collection='{}'",
+        "API request to upsert embeddings: input='{}', collection='{}'", 
         req.input_file, req.collection_name
     );
     let input_path = PathBuf::from(&req.input_file);
@@ -512,6 +549,7 @@ async fn upsert_embeddings_api(
 
     match hoarder::upsert_embeddings(&req.collection_name, &input_path, qdrant_url).await {
         Ok(_) => Ok(Json(GenericApiResponse {
+            success: true,
             message: "Embeddings upserted successfully.".to_string(),
             details: Some(format!(
                 "Upserted from {} to collection {}",
@@ -558,7 +596,7 @@ async fn build_index_api(
         let qdrant_url_inner = qdrant_url_for_spawn; // Use the URL captured for the spawn
         let dir_path = PathBuf::from(dir_clone); // Use cloned data
         let suffixes_ref: Vec<&str> = suffixes_clone.iter().map(|s| s.as_str()).collect();
-
+        
         let default_exclude_dirs = vec![
             "node_modules".to_string(),
             "target".to_string(),
@@ -570,7 +608,7 @@ async fn build_index_api(
         ];
         let exclude_dirs_owned = exclude_dirs_clone.unwrap_or(default_exclude_dirs);
         let exclude_dirs_ref: Vec<&str> = exclude_dirs_owned.iter().map(|s| s.as_str()).collect();
-
+        
         let granularity = match granularity_str_clone.as_deref() {
             // Use cloned data
             Some("coarse") => processing::Granularity::Coarse,
@@ -584,15 +622,15 @@ async fn build_index_api(
         println!("[1/4] Finding files...");
         let files_to_parse =
             match wanderer::find_files_by_suffix(&dir_path, &suffixes_ref, &exclude_dirs_ref) {
-                Ok(files) => files,
-                Err(e) => {
-                    eprintln!("BuildIndex API: Wander step failed: {}", e);
-                    return;
-                }
-            };
-        if files_to_parse.is_empty() {
-            println!("BuildIndex API: No matching files found. Index build cancelled.");
-            return;
+            Ok(files) => files,
+            Err(e) => {
+                eprintln!("BuildIndex API: Wander step failed: {}", e);
+                return;
+            }
+        };
+        if files_to_parse.is_empty() { 
+            println!("BuildIndex API: No matching files found. Index build cancelled."); 
+            return; 
         }
         println!("BuildIndex API: Found {} files.", files_to_parse.len());
 
@@ -638,9 +676,9 @@ async fn build_index_api(
             "BuildIndex API: {} entities after post-processing.",
             processed_entities.len()
         );
-        if processed_entities.is_empty() {
-            println!("BuildIndex API: No entities after processing. Index build cancelled.");
-            return;
+        if processed_entities.is_empty() { 
+            println!("BuildIndex API: No entities after processing. Index build cancelled."); 
+            return; 
         }
 
         println!("[3/4] Generating embeddings...");
@@ -698,6 +736,7 @@ async fn build_index_api(
     });
 
     Ok(Json(GenericApiResponse {
+        success: true,
         message: "Build index process started in the background.".to_string(),
         details: Some(format!(
             "Building index for dir '{}' into collection '{}'. Check server logs for progress.",
@@ -725,6 +764,13 @@ async fn editor_command_api(
         }
     };
 
+    // Get current timestamp
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+
     // Path is required by EditorArgs and API schema
     let editor_args = editor::EditorArgs {
         command: command_type,
@@ -738,14 +784,70 @@ async fn editor_command_api(
 
     let mut editor_guard = editor_data.0.lock().await;
     match editor::handle_command(&mut editor_guard, editor_args) {
-        Ok(Some(content)) => Ok(Json(EditorCommandResponse {
-            message: None,
-            content: Some(content),
-        })),
-        Ok(None) => Ok(Json(EditorCommandResponse {
-            message: Some(format!("Command '{}' executed successfully.", req.command)),
-            content: None,
-        })),
+        Ok(Some(content)) => {
+            // View command already returns content
+            Ok(Json(EditorCommandResponse {
+                success: true,
+                message: Some(format!("Command '{}' executed successfully.", req.command)),
+                content: Some(content.clone()),
+                file_path: Some(req.path.clone()),
+                operation: Some(req.command.clone()),
+                line_count: Some(content.lines().count()),
+                modified_at: Some(timestamp),
+                modified_lines: None,
+            }))
+        },
+        Ok(None) => {
+            // Non-view commands now need to fetch content to return it
+            let mut response = EditorCommandResponse {
+                success: true,
+                message: Some(format!("Command '{}' executed successfully.", req.command)),
+                content: None,
+                file_path: Some(req.path.clone()),
+                operation: Some(req.command.clone()),
+                modified_at: Some(timestamp),
+                line_count: Some(0), // Default to 0 lines until we get actual content
+                modified_lines: None,
+            };
+            
+            // For create, str_replace, insert - fetch the updated content
+            if req.command == "create" || req.command == "str_replace" || req.command == "insert" || req.command == "undo_edit" {
+                // Create a view command to fetch the content
+                let view_args = editor::EditorArgs {
+                    command: editor::CommandType::View,
+                    path: req.path.clone(),
+                    file_text: None,
+                    insert_line: None,
+                    new_str: None,
+                    old_str: None,
+                    view_range: None, // view the whole file
+                };
+                
+                if let Ok(Some(updated_content)) = editor::handle_command(&mut editor_guard, view_args) {
+                    response.content = Some(updated_content.clone());
+                    response.line_count = Some(updated_content.lines().count());
+                    
+                    // For str_replace, try to estimate affected lines
+                    if req.command == "str_replace" && req.old_str.is_some() {
+                        // Simple approach: count line breaks in old_str to estimate affected lines
+                        // For a more precise approach, we would need to track changes in the editor module
+                        if let Some(old_str) = &req.old_str {
+                            let line_count = old_str.lines().count();
+                            if line_count > 0 && line_count < 100 { // Reasonable limit
+                                response.modified_lines = Some((1..=line_count).collect());
+                            }
+                        }
+                    }
+                    
+                    // For insert, we know the affected line
+                    if req.command == "insert" && req.insert_line.is_some() {
+                        response.modified_lines = Some(vec![req.insert_line.unwrap()]);
+                    }
+                }
+            }
+            
+            Ok(Json(response))
+        },
         Err(e) => Err(poem::Error::from_string(
             e,
             poem::http::StatusCode::BAD_REQUEST,
@@ -949,10 +1051,11 @@ async fn start_server(host: String, port: u16) -> Result<()> {
         .at("/format-check", post(format_check_api))
         .at("/format-write", post(format_write_api))
         .at("/lsp/goto-definition", post(lsp_goto_definition_api))
+        .at("/package-json", get(get_package_json_api))
         .with(
             Cors::new()
-                .allow_credentials(true)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_credentials(true)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers(["Content-Type", "Authorization"]),
         );
 

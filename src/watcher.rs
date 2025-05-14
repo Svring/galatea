@@ -166,6 +166,68 @@ pub async fn ensure_typescript_language_server_available() -> Result<(), String>
         })
 }
 
+// --- package.json Parsing ---
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PackageJsonData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub scripts: std::collections::HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub dependencies: std::collections::HashMap<String, String>,
+    #[serde(
+        default,
+        rename = "devDependencies",
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub dev_dependencies: std::collections::HashMap<String, String>,
+    // Add other common fields if desired, e.g.:
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>, // Can be String or a struct
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+}
+
+pub async fn parse_package_json() -> Result<PackageJsonData, String> {
+    let project_dir = get_project_root()?;
+    let package_json_path = project_dir.join("package.json");
+
+    if !package_json_path.exists() {
+        return Err(format!(
+            "package.json not found in project directory: {}",
+            project_dir.display()
+        ));
+    }
+
+    let content = match std::fs::read_to_string(&package_json_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!(
+                "Failed to read package.json from {}: {}",
+                package_json_path.display(),
+                e
+            ));
+        }
+    };
+
+    match serde_json::from_str::<PackageJsonData>(&content) {
+        Ok(data) => Ok(data),
+        Err(e) => Err(format!(
+            "Failed to parse package.json content from {}: {}\nContent: {}",
+            package_json_path.display(),
+            e,
+            content // Include content in error for debugging if parsing fails
+        )),
+    }
+}
+
 // --- Linter (ESLint) Interaction ---
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -202,45 +264,67 @@ pub async fn run_eslint(target_paths: &[String]) -> Result<Vec<EslintResult>, St
     let project_dir = get_project_root()?;
     ensure_eslint_available().await?;
 
-    let eslint_path = project_dir.join("node_modules").join(".bin").join("eslint");
-    if !eslint_path.exists() {
-        return Err("eslint executable not found after installation attempt.".to_string());
-    }
-
-    let mut cmd = Command::new(eslint_path);
+    let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir);
-    cmd.arg("--format");
-    cmd.arg("json");
-    for path_str in target_paths {
-        cmd.arg(path_str);
+    let mut args = vec!["run", "lint", "--"]; // Separator for arguments to the script
+
+    // Add --format json. We hope 'next lint' passes this to ESLint.
+    // If 'next lint' has its own JSON output flag, this would need to change.
+    args.push("--format=json");
+
+    // How 'next lint' consumes paths can vary.
+    // Option 1: Simple append (might not work if 'next lint' expects specific flags like --file)
+    // for path_str in target_paths {
+    //     args.push(path_str);
+    // }
+    // Option 2: Using --file for each (more robust if 'next lint' supports it)
+    // This example assumes 'next lint' might just take paths directly after '--'
+    // or that its ESLint config will pick up files if paths are directories.
+    // If target_paths is empty, 'next lint' might lint all configured files.
+    if !target_paths.is_empty() {
+        for path_str in target_paths {
+            // next lint might expect --file <path> or just <path>.
+            // For simplicity, let's try just passing paths. If issues arise,
+            // this part may need adjustment based on `next lint` CLI.
+            args.push(path_str);
+        }
     }
+    // If target_paths is empty, `npm run lint -- --format=json` will be run.
+    // `next lint` by default lints common directories.
+
+    cmd.args(&args);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     println!(
-        "Running eslint with paths: {:?} in {}",
-        target_paths,
+        "Running ESLint via npm script: npm {} in {}",
+        args.join(" "),
         project_dir.display()
     );
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn eslint: {}", e))?;
+        .map_err(|e| format!("Failed to spawn 'npm run lint': {}", e))?;
     let output = child
         .wait_with_output()
         .await
-        .map_err(|e| format!("Failed to wait for eslint: {}", e))?;
+        .map_err(|e| format!("Failed to wait for 'npm run lint': {}", e))?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
 
+    // 'next lint' output with --format=json might still be wrapped or different.
+    // This parsing assumes it's standard ESLint JSON output.
     if stdout_str.trim().is_empty() {
         if output.status.success() {
-            return Ok(Vec::new()); // No issues found, empty results
+            return Ok(Vec::new());
         } else {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
+            // next lint might print its own errors to stdout even on failure with JSON format.
+            // So, if stdout is empty but status is error, show stderr.
+            // If stdout is not empty on error, it might contain the JSON or other error messages.
             return Err(format!(
-                "ESLint execution failed with status {} and no JSON output. Stderr: {}",
+                "'npm run lint' execution failed with status {} and no JSON output. Stderr: {}",
                 output.status, stderr_str
             ));
         }
@@ -250,8 +334,10 @@ pub async fn run_eslint(target_paths: &[String]) -> Result<Vec<EslintResult>, St
         Ok(results) => Ok(results),
         Err(e) => {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
+            // If JSON parsing fails, it's possible `next lint` didn't output JSON.
+            // Include stdout in the error to help diagnose.
             Err(format!(
-                "Failed to parse ESLint JSON output: {}. Stdout: '{}'. Stderr: '{}'",
+                "Failed to parse ESLint JSON output from 'npm run lint': {}. Stdout: '{}'. Stderr: '{}'",
                 e, stdout_str, stderr_str
             ))
         }
@@ -325,59 +411,55 @@ pub async fn check_prettier(target_patterns: &[String]) -> Result<Vec<String>, S
 
 pub async fn format_with_prettier(target_patterns: &[String]) -> Result<Vec<String>, String> {
     let project_dir = get_project_root()?;
-    ensure_prettier_available().await?;
+    ensure_prettier_available().await?; // Ensures 'prettier' is available for 'npx prettier' in the script
 
-    let prettier_path = project_dir
-        .join("node_modules")
-        .join(".bin")
-        .join("prettier");
-    if !prettier_path.exists() {
-        return Err("prettier executable not found after installation attempt.".to_string());
+    // The 'npm run format' script is "npx prettier ./src --write".
+    // This means target_patterns from the API will be ignored.
+    // Also, we can't get --list-different output from this script directly.
+    if !target_patterns.is_empty() {
+        println!(
+            "Warning: 'format_with_prettier' called with target_patterns: {:?}, \
+            but these will be ignored due to using 'npm run format' which targets './src'.",
+            target_patterns
+        );
     }
 
-    let mut cmd = Command::new(prettier_path);
+    let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir);
-    cmd.arg("--write");
-    cmd.arg("--list-different");
-    for pattern in target_patterns {
-        cmd.arg(pattern);
-    }
-    cmd.stdout(Stdio::piped());
+    cmd.args(&["run", "format"]);
+
+    cmd.stdout(Stdio::piped()); // Capture stdout, though we don't expect specific file list
     cmd.stderr(Stdio::piped());
 
     println!(
-        "Running prettier --write --list-different with patterns: {:?} in {}",
-        target_patterns,
+        "Running Prettier via npm script: npm run format in {}",
         project_dir.display()
     );
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn prettier --write: {}", e))?;
+        .map_err(|e| format!("Failed to spawn 'npm run format': {}", e))?;
     let output = child
         .wait_with_output()
         .await
-        .map_err(|e| format!("Failed to wait for prettier --write: {}", e))?;
+        .map_err(|e| format!("Failed to wait for 'npm run format': {}", e))?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
-        let changed_files: Vec<String> = stdout_str
-            .lines()
-            .map(String::from)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !changed_files.is_empty() {
-            println!("Prettier --write: Formatted files: {:?}", changed_files);
-        } else {
-            println!("Prettier --write: No files needed formatting or no files matched patterns.");
+        if !stdout_str.is_empty() {
+            println!("'npm run format' stdout: {}", stdout_str); // Log any output
         }
-        Ok(changed_files)
+        if !stderr_str.is_empty() {
+            println!("'npm run format' stderr: {}", stderr_str); // Log any stderr even on success
+        }
+        // Cannot reliably return changed files, so return empty Vec.
+        Ok(Vec::new())
     } else {
         Err(format!(
-            "Prettier --write failed with status: {}. Stderr: {}. Stdout: {}",
-            output.status, stderr_str, stdout_str
+            "'npm run format' failed with status: {}. Stdout: '{}'. Stderr: '{}'",
+            output.status, stdout_str, stderr_str
         ))
     }
 }
@@ -394,29 +476,39 @@ pub struct LspClient {
 impl LspClient {
     pub async fn new() -> Result<Self, String> {
         let project_dir = get_project_root()?;
+        // This ensures 'typescript-language-server' is installed, which 'npm run lsp' will use.
         ensure_typescript_language_server_available().await?;
 
-        let tsserver_path = project_dir
-            .join("node_modules")
-            .join(".bin")
-            .join("typescript-language-server");
+        let mut cmd = Command::new("npm");
+        cmd.current_dir(&project_dir);
+        cmd.args(&["run", "lsp"]); // The script "lsp": "typescript-language-server --stdio"
 
-        if !tsserver_path.exists() {
-            return Err(format!("typescript-language-server executable not found at {} even after installation attempt.", tsserver_path.display()));
-        }
+        // Stdio setup remains the same
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-        let mut child = Command::new(tsserver_path)
-            .arg("--stdio")
-            .current_dir(&project_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()) // Capture stderr for LSP too
+        println!(
+            "Spawning LSP server via npm script: npm run lsp in {}",
+            project_dir.display()
+        );
+
+        let mut child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to spawn typescript-language-server: {}", e))?;
+            .map_err(|e| format!("Failed to spawn 'npm run lsp': {}", e))?;
 
-        let stdin = child.stdin.take().ok_or("Failed to get LSP stdin")?;
-        let stdout = child.stdout.take().ok_or("Failed to get LSP stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to get LSP stderr")?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("Failed to get LSP stdin after 'npm run lsp'")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Failed to get LSP stdout after 'npm run lsp'")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("Failed to get LSP stderr after 'npm run lsp'")?;
 
         let (response_tx, response_rx) = mpsc::channel(100);
 
@@ -433,7 +525,9 @@ impl LspClient {
                     let mut line_buffer = String::new();
                     match reader.read_line(&mut line_buffer).await {
                         Ok(0) => {
-                            eprintln!("LSP stdout closed (EOF) while reading headers.");
+                            eprintln!(
+                                "LSP stdout closed (EOF) while reading headers (from npm run lsp)."
+                            );
                             return;
                         }
                         Ok(_) => {
@@ -454,7 +548,7 @@ impl LspClient {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error reading LSP stdout headers: {}", e);
+                            eprintln!("Error reading LSP stdout headers (from npm run lsp): {}", e);
                             return;
                         }
                     }
@@ -463,23 +557,28 @@ impl LspClient {
                 if let Some(len) = content_length {
                     let mut buffer = vec![0; len];
                     if reader.read_exact(&mut buffer).await.is_err() {
-                        eprintln!("LSP stdout error reading message body or closed.");
+                        eprintln!(
+                            "LSP stdout error reading message body or closed (from npm run lsp)."
+                        );
                         return;
                     }
                     let msg_str = String::from_utf8_lossy(&buffer);
                     match serde_json::from_str::<JsonRpc>(&msg_str) {
                         Ok(rpc_msg) => {
                             if stdout_tx_clone.send(rpc_msg).await.is_err() {
-                                eprintln!("Failed to send LSP message to internal channel (receiver dropped).");
+                                eprintln!("Failed to send LSP message to internal channel (receiver dropped, from npm run lsp).");
                                 return;
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to parse LSP message: {}. Raw: '{}'", e, msg_str);
+                            eprintln!(
+                                "Failed to parse LSP message (from npm run lsp): {}. Raw: '{}'",
+                                e, msg_str
+                            );
                         }
                     }
                 } else {
-                    eprintln!("LSP message did not contain a valid Content-Length header. Headers received: {:?}", headers_map);
+                    eprintln!("LSP message did not contain a valid Content-Length header (from npm run lsp). Headers received: {:?}", headers_map);
                 }
             }
         });
@@ -491,15 +590,15 @@ impl LspClient {
             loop {
                 match stderr_reader.read_line(&mut line).await {
                     Ok(0) => {
-                        eprintln!("LSP stderr closed (EOF).");
+                        eprintln!("LSP stderr closed (EOF) (from npm run lsp).");
                         return;
                     } // EOF
                     Ok(_) => {
-                        eprint!("LSP stderr: {}", line);
+                        eprint!("LSP stderr (from npm run lsp): {}", line); // Prefix to distinguish
                         line.clear();
                     }
                     Err(e) => {
-                        eprintln!("Error reading from LSP stderr: {}", e);
+                        eprintln!("Error reading from LSP stderr (from npm run lsp): {}", e);
                         return;
                     }
                 }
@@ -521,11 +620,7 @@ impl LspClient {
     async fn send_rpc(&mut self, rpc: JsonRpc) -> Result<(), String> {
         let msg_json = serde_json::to_string(&rpc)
             .map_err(|e| format!("Failed to serialize LSP RPC: {}", e))?;
-        let msg_with_header = format!(
-            "Content-Length: {}\r\n\r\n{}",
-            msg_json.len(),
-            msg_json
-        );
+        let msg_with_header = format!("Content-Length: {}\r\n\r\n{}", msg_json.len(), msg_json);
 
         self.writer
             .write_all(msg_with_header.as_bytes())
@@ -587,10 +682,8 @@ impl LspClient {
         root_uri: Uri,
         client_capabilities: ClientCapabilities,
     ) -> Result<lsp_types::InitializeResult, String> {
-        let workspace_folder_path = root_uri
-            .path()
-            .to_string();
-        
+        let workspace_folder_path = root_uri.path().to_string();
+
         let workspace_folder_name = Path::new(&workspace_folder_path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -605,7 +698,7 @@ impl LspClient {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: Some(root_uri), // This is still technically needed for older LSP versions or specific servers
-            root_path: None, // Deprecated in favor of root_uri and workspace_folders
+            root_path: None,          // Deprecated in favor of root_uri and workspace_folders
             initialization_options: None,
             capabilities: client_capabilities,
             trace: None,

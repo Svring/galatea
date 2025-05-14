@@ -107,7 +107,11 @@ async fn upsert_entities_core(
 }
 
 // Public function for file-based operation (Original name)
-pub async fn upsert_embeddings(collection_name: &str, json_file_path: &Path, qdrant_url: &str) -> Result<()> {
+pub async fn upsert_embeddings(
+    collection_name: &str,
+    json_file_path: &Path,
+    qdrant_url: &str,
+) -> Result<()> {
     let client = Qdrant::from_url(qdrant_url).build()?;
     println!("Reading embeddings from: {}", json_file_path.display());
     let json_content = fs::read_to_string(json_file_path)
