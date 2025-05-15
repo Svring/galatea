@@ -6,14 +6,15 @@ use tokio::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Use modules
-use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher};
+use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver};
 
 // Add Poem imports
 use poem::{
-    endpoint::StaticFilesEndpoint, get, handler, http::Method, listener::TcpListener,
+    endpoint::StaticFilesEndpoint, get, handler, http::{Method, StatusCode}, listener::TcpListener,
     middleware::Cors, post, web::Data, web::Json, EndpointExt, Route, Server,
 };
 use serde::{Deserialize, Serialize};
+use lsp_types::Uri;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -242,7 +243,7 @@ struct EditorCommandResponse {
 // ESLint
 #[derive(Debug, Serialize, Deserialize)]
 struct LintRequest {
-    paths: Vec<String>,
+    // paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -275,7 +276,7 @@ struct FormatWriteResponse {
 // LSP - Goto Definition
 #[derive(Debug, Serialize, Deserialize)]
 struct GotoDefinitionApiRequest {
-    uri: String,    // e.g., "file:///path/to/project/file.ts"
+    uri: String,    // e.g., "file:///path/to/project/file.ts" or a partial path
     line: u32,      // 0-indexed
     character: u32, // 0-indexed
 }
@@ -299,15 +300,15 @@ async fn get_package_json_api() -> Result<Json<watcher::PackageJsonData>, poem::
         Ok(data) => Ok(Json(data)),
         Err(e) => {
             // Determine if the error is due to file not found or parsing error for status code
-            if e.contains("package.json not found") {
+            if e.to_string().contains("package.json not found") {
                 Err(poem::Error::from_string(
                     format!("Error getting package.json: {}", e),
-                    poem::http::StatusCode::NOT_FOUND, // 404 if not found
+                    StatusCode::NOT_FOUND, // 404 if not found
                 ))
             } else {
                 Err(poem::Error::from_string(
                     format!("Error parsing package.json: {}", e),
-                    poem::http::StatusCode::INTERNAL_SERVER_ERROR, // 500 for other errors like parsing
+                    StatusCode::INTERNAL_SERVER_ERROR, // 500 for other errors like parsing
                 ))
             }
         }
@@ -333,7 +334,7 @@ async fn find_files(
     });
     let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
     
-    match wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref) {
+    match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
         Ok(found_files) => {
             let file_paths = found_files
                 .iter()
@@ -343,7 +344,7 @@ async fn find_files(
         }
         Err(e) => Err(poem::Error::from_string(
             format!("Error searching directory: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -352,12 +353,15 @@ async fn find_files(
 async fn parse_file(
     Json(req): Json<ParseFileRequest>,
 ) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    let file_path = PathBuf::from(&req.file_path);
+    let file_path = match resolver::resolve_path(&req.file_path) {
+        Ok(p) => p,
+        Err(e) => return Err(poem::Error::from_string(e.to_string(), StatusCode::BAD_REQUEST)),
+    };
     
     if !file_path.exists() {
         return Err(poem::Error::from_string(
             format!("File not found: {}", file_path.display()),
-            poem::http::StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
         ));
     }
     
@@ -365,7 +369,7 @@ async fn parse_file(
         .extension()
         .and_then(|ext| ext.to_str())
         .ok_or_else(|| {
-            poem::Error::from_string("File has no extension", poem::http::StatusCode::BAD_REQUEST)
+            poem::Error::from_string("File has no extension", StatusCode::BAD_REQUEST)
         })?;
         
     let parse_result = match extension {
@@ -379,7 +383,7 @@ async fn parse_file(
         Ok(entities) => Ok(Json(entities)),
         Err(e) => Err(poem::Error::from_string(
             format!("Error parsing file: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -410,12 +414,12 @@ async fn parse_directory(
     };
     
     let files_to_parse =
-        match wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref) {
+        match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
         Ok(files) => files,
             Err(e) => {
                 return Err(poem::Error::from_string(
             format!("Error finding files: {}", e),
-                    poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::INTERNAL_SERVER_ERROR,
         ))
             }
     };
@@ -471,7 +475,7 @@ async fn query_collection(
             eprintln!("Error in API query_collection: {}", e);
             Err(poem::Error::from_string(
                 format!("Error querying collection: {}", e),
-                poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
     }
@@ -491,7 +495,7 @@ async fn generate_embeddings_api(
     if !input_path.exists() {
         return Err(poem::Error::from_string(
             format!("Input file not found: {}", req.input_file),
-            poem::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
         ));
     }
 
@@ -513,7 +517,7 @@ async fn generate_embeddings_api(
             eprintln!("Error in API generate_embeddings_api: {}", e);
             Err(poem::Error::from_string(
                 format!("Failed to generate embeddings: {}", e),
-                poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
     }
@@ -533,7 +537,7 @@ async fn upsert_embeddings_api(
     if !input_path.exists() {
         return Err(poem::Error::from_string(
             format!("Input file not found: {}", req.input_file),
-            poem::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
         ));
     }
 
@@ -560,7 +564,7 @@ async fn upsert_embeddings_api(
             eprintln!("Error in API upsert_embeddings_api: {}", e);
             Err(poem::Error::from_string(
                 format!("Failed to upsert embeddings: {}", e),
-                poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
     }
@@ -621,7 +625,7 @@ async fn build_index_api(
 
         println!("[1/4] Finding files...");
         let files_to_parse =
-            match wanderer::find_files_by_suffix(&dir_path, &suffixes_ref, &exclude_dirs_ref) {
+            match wanderer::find_files_by_extensions(&dir_path, &suffixes_ref, &exclude_dirs_ref) {
             Ok(files) => files,
             Err(e) => {
                 eprintln!("BuildIndex API: Wander step failed: {}", e);
@@ -759,10 +763,30 @@ async fn editor_command_api(
         _ => {
             return Err(poem::Error::from_string(
                 format!("Invalid command type: {}", req.command),
-                poem::http::StatusCode::BAD_REQUEST,
+                StatusCode::BAD_REQUEST,
             ))
         }
     };
+
+    // Resolve the path, except for 'undo_edit' which might not need a path
+    // or its path meaning is different (e.g. last edited file, handled by Editor state).
+    // For simplicity, we'll resolve it. If Editor can handle relative/unresolved paths for undo context, that's fine.
+    let resolved_req_path = match resolver::resolve_path(&req.path) {
+        Ok(p) => p,
+        Err(e) => return Err(poem::Error::from_string(e.to_string(), StatusCode::BAD_REQUEST)),
+    };
+
+    // Ensure the path exists for commands that operate on existing files, if necessary.
+    // 'create' doesn't need it to exist. 'view', 'str_replace', 'insert' likely do.
+    // 'undo_edit' might operate on a path that was just deleted, or a conceptual path.
+    if command_type != editor::CommandType::Create && 
+       command_type != editor::CommandType::UndoEdit && // Assuming undo might not need path to exist right now
+       !resolved_req_path.exists() {
+        return Err(poem::Error::from_string(
+            format!("File not found at resolved path: {}", resolved_req_path.display()),
+            StatusCode::NOT_FOUND,
+        ));
+    }
 
     // Get current timestamp
     let timestamp = SystemTime::now()
@@ -774,7 +798,7 @@ async fn editor_command_api(
     // Path is required by EditorArgs and API schema
     let editor_args = editor::EditorArgs {
         command: command_type,
-        path: req.path.clone(), // path is always required by schema
+        path: resolved_req_path.to_string_lossy().into_owned(), // Use resolved path
         file_text: req.file_text.clone(),
         insert_line: req.insert_line,
         new_str: req.new_str.clone(),
@@ -812,10 +836,10 @@ async fn editor_command_api(
             
             // For create, str_replace, insert - fetch the updated content
             if req.command == "create" || req.command == "str_replace" || req.command == "insert" || req.command == "undo_edit" {
-                // Create a view command to fetch the content
+                // Create a view command to fetch the content, using the resolved path of the original request
                 let view_args = editor::EditorArgs {
                     command: editor::CommandType::View,
-                    path: req.path.clone(),
+                    path: resolved_req_path.to_string_lossy().into_owned(), // Use resolved path
                     file_text: None,
                     insert_line: None,
                     new_str: None,
@@ -850,18 +874,18 @@ async fn editor_command_api(
         },
         Err(e) => Err(poem::Error::from_string(
             e,
-            poem::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
         )),
     }
 }
 
 #[handler]
-async fn lint_files_api(Json(req): Json<LintRequest>) -> Result<Json<LintResponse>, poem::Error> {
-    match watcher::run_eslint(&req.paths).await {
+async fn lint_files_api(Json(_req): Json<LintRequest>) -> Result<Json<LintResponse>, poem::Error> {
+    match watcher::run_eslint().await {
         Ok(results) => Ok(Json(LintResponse { results })),
         Err(e) => Err(poem::Error::from_string(
             format!("Error running ESLint: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -874,7 +898,7 @@ async fn format_check_api(
         Ok(unformatted_files) => Ok(Json(FormatCheckResponse { unformatted_files })),
         Err(e) => Err(poem::Error::from_string(
             format!("Error checking with Prettier: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -887,7 +911,7 @@ async fn format_write_api(
         Ok(formatted_files) => Ok(Json(FormatWriteResponse { formatted_files })),
         Err(e) => Err(poem::Error::from_string(
             format!("Error formatting with Prettier: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -897,37 +921,42 @@ async fn lsp_goto_definition_api(
     lsp_client_data: Data<&Arc<Mutex<watcher::LspClient>>>,
     Json(req): Json<GotoDefinitionApiRequest>,
 ) -> Result<Json<GotoDefinitionApiResponse>, poem::Error> {
-    let file_uri = match req.uri.parse::<lsp_types::Uri>() {
-        Ok(uri) => uri,
-        Err(e) => {
+    // 1. Resolve the input string (which could be a URI string or a partial path)
+    //    to a canonical PathBuf using the resolver module.
+    let resolved_file_path: PathBuf = match resolver::resolve_path(&req.uri) {
+        Ok(p) => p,
+        Err(e) => { // e is anyhow::Error
             return Err(poem::Error::from_string(
-                format!("Invalid URI format '{}': {}", req.uri, e),
-                poem::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "Failed to resolve input path/URI '{}' to a project file: {}",
+                    req.uri,
+                    e.to_string()
+                ),
+                StatusCode::BAD_REQUEST,
             ));
         }
     };
 
-    let mut file_path_str = file_uri.path().to_string(); // Convert URI path component to String
-    #[cfg(windows)]
-    {
-        // On Windows, Uri path might start with a leading `/` for a path like `C:\...`,
-        // e.g., `/c:/Users/...`. We need to strip it if present for PathBuf.
-        if file_path_str.starts_with('/') && file_path_str.chars().nth(2) == Some(':') {
-            file_path_str = file_path_str[1..].to_string();
+    let file_uri = match resolver::resolve_path_to_uri(&req.uri) {
+        Ok(uri) => uri,
+        Err(e) => {
+            return Err(poem::Error::from_string(
+                format!("Failed to resolve input path/URI '{}' to a project file: {}", req.uri, e.to_string()),
+                StatusCode::BAD_REQUEST,
+            ));
         }
-    }
-    let file_path = PathBuf::from(file_path_str);
-
-    let file_content = match std::fs::read_to_string(&file_path) {
+    };
+    
+    let file_content = match std::fs::read_to_string(&resolved_file_path) {
         Ok(content) => content,
         Err(e) => {
             return Err(poem::Error::from_string(
                 format!(
                     "Failed to read file for LSP didOpen '{}': {}",
-                    file_path.display(),
+                    resolved_file_path.display(),
                     e
                 ),
-                poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
     };
@@ -939,13 +968,11 @@ async fn lsp_goto_definition_api(
 
     let mut client_guard = lsp_client_data.0.lock().await;
 
-    // Notify didOpen before gotoDefinition
-    // Determine language ID based on extension - simplistic, could be improved
-    let language_id = file_path
+    let language_id = resolved_file_path
         .extension()
         .and_then(|ext| ext.to_str())
         .map_or_else(
-            || "plaintext".to_string(), // Default if no extension
+            || "plaintext".to_string(),
             |ext| match ext {
                 "ts" => "typescript".to_string(),
                 "tsx" => "typescriptreact".to_string(),
@@ -960,8 +987,6 @@ async fn lsp_goto_definition_api(
         .notify_did_open(file_uri.clone(), &language_id, 0, file_content)
         .await
     {
-        // Log this error but proceed to goto_definition anyway, as some servers might allow it
-        // or the file might have been opened by another means.
         eprintln!(
             "LSP notify_did_open failed (continuing to goto_definition): {}",
             e
@@ -972,7 +997,7 @@ async fn lsp_goto_definition_api(
         Ok(locations) => Ok(Json(GotoDefinitionApiResponse { locations })),
         Err(e) => Err(poem::Error::from_string(
             format!("LSP goto_definition failed: {}", e),
-            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
 }
@@ -980,9 +1005,6 @@ async fn lsp_goto_definition_api(
 async fn start_server(host: String, port: u16) -> Result<()> {
     let editor_state = Arc::new(Mutex::new(editor::Editor::new()));
 
-    // Initialize LSP Client
-    // This will attempt to install typescript-language-server if not present in ./project
-    // and then spawn it.
     let lsp_client = match watcher::LspClient::new().await {
         Ok(client) => client,
         Err(e) => {
@@ -990,38 +1012,20 @@ async fn start_server(host: String, port: u16) -> Result<()> {
                 "Failed to initialize LSP client: {}. LSP features will be unavailable.",
                 e
             );
-            // We could panic here, or proceed without LSP. For now, proceed.
-            // A more robust solution might involve a placeholder client or retries.
-            // This is a simplified approach for now.
-            // Creating a dummy or non-functional client if new() fails would be complex
-            // for just satisfying type constraints if it was an Option or Result.
-            // For now, if it fails, the server starts but /api/lsp calls would likely fail
-            // if the client isn't properly shared or if this unwrap is hit.
-            // A better way is to make lsp_client_state an Option<Arc<Mutex<...>>>
-            // For now, let's assume it must succeed or we panic.
             panic!("LSP Client initialization failed: {}", e);
         }
     };
-    // Initialize the LSP server with client capabilities
-    // This needs to be done once after the LspClient is created.
-    // The root URI should point to the './project' directory.
+
     let project_root_path =
-        watcher::get_project_root() // Using watcher's helper
+        resolver::get_project_root() // Use resolver::get_project_root
             .map_err(|e| anyhow::anyhow!("Failed to get project root for LSP: {}", e))?;
-    let root_uri_str = format!("file://{}", project_root_path.to_string_lossy());
-    let root_uri = root_uri_str
-        .parse::<lsp_types::Uri>() // Use FromStr trait
-        .map_err(|e| anyhow::anyhow!("Failed to parse project root URI for LSP: {}", e))?;
+    
+    // Convert project_root_path to an LspUri for the LSP client initialize method
+    let root_uri: Uri = resolver::resolve_path_to_uri(&project_root_path)
+        .map_err(|e| anyhow::anyhow!("Failed to resolve project root path {} to a URI: {}", project_root_path.display(), e))?;
 
-    // Define basic client capabilities
-    let client_capabilities = lsp_types::ClientCapabilities::default(); // Basic capabilities
-
-    // Perform initialization
-    // We need mutable access to lsp_client here.
-    // If we wrap it in Arc<Mutex<>> too early, this becomes tricky.
-    // Let's initialize it before wrapping for server state.
-
-    let mut lsp_client_instance = lsp_client; // Take ownership to make it mutable
+    let client_capabilities = lsp_types::ClientCapabilities::default();
+    let mut lsp_client_instance = lsp_client;
 
     if let Err(e) = lsp_client_instance
         .initialize(root_uri.clone(), client_capabilities.clone())
@@ -1031,10 +1035,8 @@ async fn start_server(host: String, port: u16) -> Result<()> {
             "LSP server initialization failed: {}. GotoDefinition might not work.",
             e
         );
-        // Decide if server should still start. For now, it will.
     }
 
-    // Now wrap it for sharing across API handlers
     let lsp_client_state = Arc::new(Mutex::new(lsp_client_instance));
 
     let api_app = Route::new()
@@ -1097,7 +1099,7 @@ async fn main() -> Result<()> {
                     dir.display(),
                     exclude_dirs.join(", ")
                 );
-                match wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref) {
+                match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
                     Ok(found_files) => {
                         if found_files.is_empty() {
                             println!("No matching files found.");
@@ -1131,7 +1133,7 @@ async fn main() -> Result<()> {
                     exclude_dirs
                 );
                 let files_to_parse =
-                    wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref)?;
+                    wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref)?;
                 if files_to_parse.is_empty() {
                     println!("No matching files found to parse.");
                     return Ok(());
@@ -1270,7 +1272,7 @@ async fn main() -> Result<()> {
                 let suffixes_ref: Vec<&str> = suffixes.iter().map(|s| s.as_str()).collect();
                 let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
                 let files_to_parse =
-                    wanderer::find_files_by_suffix(&dir, &suffixes_ref, &exclude_dirs_ref)
+                    wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref)
                         .with_context(|| {
                             format!("Wander step failed in dir '{}'", dir.display())
                         })?;

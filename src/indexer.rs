@@ -22,22 +22,22 @@ use std::path::Path;
 /// `Ok(())` on success, or an error.
 pub fn index_directory(
     start_path: &Path,
-    suffixes: &[&str],
+    extensions: &[&str],
     output_file: &Path,
     max_snippet_size: Option<usize>,
     exclude_dirs: &[&str],
     granularity: processing::Granularity, // Add granularity parameter
 ) -> Result<()> {
     println!(
-        "Starting indexing in '{}' for suffixes: {:?} (excluding: {:?}, granularity: {:?})",
+        "Starting indexing in '{}' for extensions: {:?} (excluding: {:?}, granularity: {:?})",
         start_path.display(),
-        suffixes,
+        extensions,
         exclude_dirs,
         granularity // Log granularity
     );
 
     // 1. Find files, passing exclude_dirs
-    let files_to_parse = wanderer::find_files_by_suffix(start_path, suffixes, exclude_dirs)
+    let files_to_parse = wanderer::find_files_by_extensions(start_path, extensions, exclude_dirs)
         .with_context(|| format!("Failed scanning directory '{}'", start_path.display()))?;
 
     if files_to_parse.is_empty() {
