@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -10,33 +10,33 @@ use tokio::sync::mpsc;
 use anyhow::{anyhow, Context, Result};
 
 use jsonrpc_lite::{Id, JsonRpc, Params};
-use lsp_types::notification::Notification as LspNotificationTrait;
-use lsp_types::request::Request as LspRequestTrait;
+use lsp_types::notification::Notification;
+use lsp_types::request::Request;
 use lsp_types::{
     ClientCapabilities, DidOpenTextDocumentParams, GotoDefinitionParams, InitializeParams,
     PartialResultParams, Position, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri as LspUri, WorkDoneProgressParams, WorkspaceFolder,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams, WorkspaceFolder,
 };
 
 use crate::resolver;
 
 // --- Project and Dependency Management ---
 
-async fn run_npm_command(
-    project_dir: &Path,
-    args: &[&str],
-    suppress_output: bool,
-) -> Result<()> {
+async fn run_npm_command(project_dir: &Path, args: &[&str], suppress_output: bool) -> Result<()> {
     let mut cmd = Command::new("npm");
     cmd.current_dir(project_dir);
     cmd.args(args);
 
-    if suppress_output {
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-    } else {
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+    // Configure stdout/stderr based on suppress_output flag
+    match suppress_output {
+        true => {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+        false => {
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+        }
     }
 
     println!(
@@ -51,99 +51,80 @@ async fn run_npm_command(
             args.join(" ")
         )
     })?;
+
     let output = child
         .wait_with_output()
         .await
         .with_context(|| format!("Failed to wait for npm command: npm {}", args.join(" ")))?;
 
-    if output.status.success() {
-        if !suppress_output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
+    match output.status.success() {
+        true => {
+            // Only print stdout if not suppressing output and stdout is not empty
+            if !suppress_output {
+                let stdout_data = String::from_utf8_lossy(&output.stdout);
+                if !stdout_data.is_empty() {
+                    println!("npm stdout:\n{}", stdout_data);
+                }
+            }
+            Ok(())
+        }
+        false => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout); // stdout might also contain error info for npm
+            Err(anyhow!(
+                "npm command failed with status: {}.\nCommand: npm {}\nStderr: {}\nStdout: {}",
+                output.status,
+                args.join(" "),
+                stderr,
+                stdout
+            ))
+        }
+    }
+}
+
+// Merged function to ensure core development dependencies are available
+pub async fn ensure_dev_deps() -> Result<()> {
+    let project_dir = resolver::get_project_root()?;
+    let dev_dependencies_to_ensure = [
+        "prettier",
+        "typescript-language-server",
+        "typescript", // Peer dependency for typescript-language-server
+    ];
+
+    for tool_name in dev_dependencies_to_ensure.iter() {
+        let bin_path = project_dir
+            .join("node_modules")
+            .join(".bin")
+            .join(tool_name);
+        let package_path = project_dir.join("node_modules").join(tool_name);
+
+        match bin_path.exists() || package_path.exists() {
+            false => {
                 println!(
-                    "npm stdout:
-{}",
-                    stdout
+                    "Development dependency '{}' not found locally. Attempting to install...",
+                    tool_name
+                );
+                run_npm_command(
+                    &project_dir,
+                    &["install", "--loglevel", "error", "--save-dev", tool_name],
+                    true, // suppress_output
+                )
+                .await
+                .with_context(|| format!("Failed to install npm tool '{}'", tool_name))?;
+                println!(
+                    "Development dependency '{}' installed successfully.",
+                    tool_name
+                );
+            }
+            true => {
+                println!(
+                    "Development dependency '{}' is already installed locally in the project.",
+                    tool_name
                 );
             }
         }
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout); // stdout might also contain error info for npm
-        Err(anyhow!(
-            "npm command failed with status: {}.\nCommand: npm {}\nStderr: {}\nStdout: {}",
-            output.status,
-            args.join(" "),
-            stderr,
-            stdout
-        ))
     }
-}
-
-async fn is_tool_locally_installed(tool_name: &str, project_dir: &Path) -> bool {
-    let bin_path = project_dir
-        .join("node_modules")
-        .join(".bin")
-        .join(tool_name);
-    let package_path = project_dir.join("node_modules").join(tool_name);
-    bin_path.exists() || package_path.exists()
-}
-
-async fn ensure_npm_tool_available(
-    tool_name: &str,
-    project_dir: &Path,
-    dev_dependency: bool,
-    suppress_install_output: bool,
-) -> Result<()> {
-    if is_tool_locally_installed(tool_name, project_dir).await {
-        println!(
-            "Tool '{}' is already installed locally in the project.",
-            tool_name
-        );
-        return Ok(());
-    }
-
-    println!(
-        "Tool '{}' not found locally. Attempting to install...",
-        tool_name
-    );
-    let mut args = vec!["install", "--loglevel", "error"]; // reduce default npm noise
-    if dev_dependency {
-        args.push("--save-dev");
-    }
-    args.push(tool_name);
-
-    run_npm_command(project_dir, &args, suppress_install_output)
-        .await
-        .with_context(|| format!("Failed to install npm tool '{}'", tool_name))?;
-    println!("Tool '{}' installed successfully.", tool_name);
     Ok(())
-}
-
-pub async fn ensure_eslint_available() -> Result<()> {
-    let project_dir = resolver::get_project_root()?;
-    ensure_npm_tool_available("eslint", &project_dir, true, true)
-        .await
-        .context("Failed to ensure eslint is available")
-}
-
-pub async fn ensure_prettier_available() -> Result<()> {
-    let project_dir = resolver::get_project_root()?;
-    ensure_npm_tool_available("prettier", &project_dir, true, true)
-        .await
-        .context("Failed to ensure prettier is available")
-}
-
-pub async fn ensure_typescript_language_server_available() -> Result<()> {
-    let project_dir = resolver::get_project_root()?;
-    // typescript-language-server and its peer dependency typescript
-    ensure_npm_tool_available("typescript-language-server", &project_dir, true, true)
-        .await
-        .context("Failed to ensure typescript-language-server is available")?;
-    ensure_npm_tool_available("typescript", &project_dir, true, true)
-        .await
-        .context("Failed to ensure typescript (peer dependency for typescript-language-server) is available")
 }
 
 // --- package.json Parsing ---
@@ -186,15 +167,20 @@ pub async fn parse_package_json() -> Result<PackageJsonData> {
         ));
     }
 
-    let content = std::fs::read_to_string(&package_json_path)
-        .with_context(|| format!("Failed to read package.json from {}", package_json_path.display()))?;
+    let content = std::fs::read_to_string(&package_json_path).with_context(|| {
+        format!(
+            "Failed to read package.json from {}",
+            package_json_path.display()
+        )
+    })?;
 
-    serde_json::from_str::<PackageJsonData>(&content)
-        .with_context(|| format!(
+    serde_json::from_str::<PackageJsonData>(&content).with_context(|| {
+        format!(
             "Failed to parse package.json content from {}\nContent: {}",
             package_json_path.display(),
             content
-        ))
+        )
+    })
 }
 
 // --- Linter (ESLint) Interaction ---
@@ -231,233 +217,149 @@ pub struct EslintResult {
 
 pub async fn run_eslint() -> Result<Vec<EslintResult>> {
     let project_dir = resolver::get_project_root()?;
-    ensure_eslint_available().await.context("ESLint not available")?;
+    ensure_dev_deps()
+        .await
+        .context("Failed to ensure development dependencies for ESLint")?;
 
     let mut cmd = Command::new("npm");
-    cmd.current_dir(&project_dir);
-    let args = vec!["run", "lint"];
-
-    cmd.args(&args);
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.current_dir(&project_dir)
+        .args(["run", "lint"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     println!(
-        "Running ESLint via npm script: npm {} in {}",
-        args.join(" "),
+        "Running ESLint via npm script: npm run lint in {}",
         project_dir.display()
     );
 
-    let child = cmd
+    let output = cmd
         .spawn()
-        .with_context(|| format!("Failed to spawn 'npm run lint' for project {}", project_dir.display()))?;
-    let output = child
+        .with_context(|| {
+            format!(
+                "Failed to spawn 'npm run lint' for project {}",
+                project_dir.display()
+            )
+        })?
         .wait_with_output()
         .await
-        .with_context(|| format!("Failed to wait for 'npm run lint' for project {}", project_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to wait for 'npm run lint' for project {}",
+                project_dir.display()
+            )
+        })?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-    // 1. Handle explicit "no errors" message from `next lint` (or similar tools)
-    if stdout_str.contains("✔ No ESLint warnings or errors") 
-        || stdout_str.contains("No problems found!") // Common ESLint direct output
-        || stdout_str.contains("All matched files use Prettier code style!") // For Prettier via ESLint
-    {
-        if output.status.success() {
-            println!("ESLint reported no warnings or errors via text output.");
-            return Ok(Vec::new());
-        } else {
-            // Unusual: success message but error status.
-            return Err(anyhow!(
-                "'npm run lint' reported a text-based success message but exited with status {}. Stdout: '{}'. Stderr: '{}'",
-                output.status, stdout_str, stderr_str
-            ));
-        }
-    }
-
-    // 2. Handle cases where stdout might be empty (or only whitespace)
-    if stdout_str.trim().is_empty() {
-        if output.status.success() {
-            println!("ESLint command succeeded with empty stdout. Assuming no lint issues.");
-            // This can happen if ESLint is configured to output '[]' for no errors to a file,
-            // and script redirects stdout, or if the script itself is silent on success.
-            return Ok(Vec::new());
-        } else {
-            // Failed and produced no stdout.
-            return Err(anyhow!(
-                "'npm run lint' execution failed with status {} and empty stdout. Stderr: '{}'",
-                output.status, stderr_str
-            ));
-        }
-    }
-
-    // 3. Attempt to find and parse JSON if present in non-empty stdout.
-    // ESLint's JSON output is an array. Find the part of the string that is `[{...}]` or `[]`.
-    let mut json_data_to_parse: Option<String> = None;
-    if let Some(start_brace) = stdout_str.find('[') {
-        // Try to find the corresponding end brace for the array.
-        // This is a simplified heuristic. A full parser would be needed for nested structures
-        // if the output wasn't just a top-level array.
-        if let Some(end_brace) = stdout_str.rfind(']') {
-            if end_brace >= start_brace {
-                 json_data_to_parse = Some(stdout_str[start_brace..=end_brace].to_string());
-            }
-        }
-    }
-    
-    if let Some(json_str_slice) = json_data_to_parse {
-        match serde_json::from_str::<Vec<EslintResult>>(&json_str_slice) {
-            Ok(results) => {
-                println!("Successfully parsed extracted ESLint JSON output ({} results).", results.len());
-                return Ok(results);
-            }
-            Err(e_parse) => {
-                // Extracted a potential JSON slice, but it failed to parse.
-                // This is more specific than failing to parse the whole stdout.
-                // Fall through to trying to parse the whole stdout_str, as the slice might have been wrong.
-                 eprintln!(
-                    "Failed to parse the extracted JSON slice from 'npm run lint' output: {}. Slice: '{}'. Will attempt to parse full stdout.",
-                    e_parse, json_str_slice
-                );
-            }
-        }
-    }
-
-    // 4. If not the "no errors" message, not empty, and no valid JSON slice found/parsed:
-    // This means the output is unexpected. Try parsing the whole stdout_str.
-    // This will give the original error context if JSON is present but malformed or our slicing failed.
     match serde_json::from_str::<Vec<EslintResult>>(&stdout_str) {
         Ok(results) => {
-            println!("Successfully parsed full ESLint JSON output after slice attempt failed or was skipped ({} results).", results.len());
-            return Ok(results);
+            // JSON parsing successful
+            if !output.status.success() {
+                eprintln!(
+                    "ESLint command 'npm run lint' failed with status {}, but valid JSON output was parsed. Using JSON results. Stderr: '{}'",
+                    output.status, stderr_str
+                );
+            }
+            Ok(results)
         }
-        Err(e_full_parse) => {
-             return Err(anyhow!(
-                "Failed to parse ESLint output from 'npm run lint'. Output was not a known success message, not empty, and no valid JSON was found or parsable. Serde error on full output: {}. Full Stdout: '{}'. Stderr: '{}'",
-                e_full_parse, stdout_str, stderr_str
-            ));
+        Err(_e_parse_json) => {
+            // JSON parsing failed, treat output as plain text
+            match output.status.success() {
+                true => {
+                    // Command succeeded. Check for known plain text success messages or empty output.
+                    let trimmed_stdout = stdout_str.trim();
+                    let is_success_message = trimmed_stdout.is_empty()
+                        || [
+                            "✔ No ESLint warnings or errors",
+                            "No problems found!",
+                            "All matched files use Prettier code style!",
+                        ]
+                        .iter()
+                        .any(|msg| trimmed_stdout.contains(msg));
+
+                    if is_success_message {
+                        println!("ESLint command 'npm run lint' succeeded. Output was plain text indicating no issues (or empty).");
+                    } else {
+                        // Command succeeded, but output is unrecognized plain text.
+                        println!(
+                            "Warning: ESLint command 'npm run lint' succeeded, but its plain text output was not a known success message and not JSON. Assuming no parseable lint issues. Stdout: '{}'",
+                            stdout_str
+                        );
+                    }
+                    Ok(Vec::new())
+                }
+                false => {
+                    // Command failed, and output was not JSON.
+                    Err(anyhow!(
+                        "'npm run lint' execution failed with status {}. Output was not parseable as JSON. Stdout: '{}'. Stderr: '{}'",
+                        output.status, stdout_str, stderr_str
+                    ))
+                }
+            }
         }
     }
 }
 
 // --- Formatter (Prettier) Interaction ---
 
-pub async fn check_prettier(target_patterns: &[String]) -> Result<Vec<String>> {
+pub async fn run_format() -> Result<Vec<String>> {
     let project_dir = resolver::get_project_root()?;
-    ensure_prettier_available().await.context("Prettier not available")?;
-
-    let prettier_path = project_dir
-        .join("node_modules")
-        .join(".bin")
-        .join("prettier");
-    if !prettier_path.exists() {
-        return Err(anyhow!("prettier executable not found after installation attempt."));
-    }
-
-    let mut cmd = Command::new(prettier_path);
-    cmd.current_dir(&project_dir);
-    cmd.arg("--check");
-    for pattern in target_patterns {
-        cmd.arg(pattern);
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped()); // Capture stderr for error reporting
-
-    println!(
-        "Running prettier --check with patterns: {:?} in {}",
-        target_patterns,
-        project_dir.display()
-    );
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn prettier --check for project {}", project_dir.display()))?;
-    let output = child
-        .wait_with_output()
+    ensure_dev_deps()
         .await
-        .with_context(|| format!("Failed to wait for prettier --check for project {}", project_dir.display()))?;
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-    match output.status.code() {
-        Some(0) => {
-            // Success, all formatted
-            println!("Prettier --check: All specified files are formatted correctly.");
-            Ok(Vec::new())
-        }
-        Some(1) => {
-            // Some files were not formatted
-            let unformatted_files: Vec<String> = stdout_str
-                .lines()
-                .map(String::from)
-                .filter(|s| !s.is_empty())
-                .collect();
-            Ok(unformatted_files)
-        }
-        _ => {
-            // Other errors
-            Err(anyhow!(
-                "Prettier --check failed with status: {}. Stderr: {}. Stdout: {}",
-                output.status, stderr_str, stdout_str
-            ))
-        }
-    }
-}
-
-pub async fn format_with_prettier(target_patterns: &[String]) -> Result<Vec<String>> {
-    let project_dir = resolver::get_project_root()?;
-    ensure_prettier_available().await.context("Prettier not available for formatting")?; // Ensures 'prettier' is available for 'npx prettier' in the script
-
-    // The 'npm run format' script is "npx prettier ./src --write".
-    // This means target_patterns from the API will be ignored.
-    // Also, we can't get --list-different output from this script directly.
-    if !target_patterns.is_empty() {
-        println!(
-            "Warning: 'format_with_prettier' called with target_patterns: {:?}, \
-            but these will be ignored due to using 'npm run format' which targets './src'.",
-            target_patterns
-        );
-    }
+        .context("Failed to ensure development dependencies for Prettier format")?;
 
     let mut cmd = Command::new("npm");
-    cmd.current_dir(&project_dir);
-    cmd.args(&["run", "format"]);
-
-    cmd.stdout(Stdio::piped()); // Capture stdout, though we don't expect specific file list
-    cmd.stderr(Stdio::piped());
+    cmd.current_dir(&project_dir)
+        .args(&["run", "format"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     println!(
         "Running Prettier via npm script: npm run format in {}",
         project_dir.display()
     );
 
-    let child = cmd
+    let output = cmd
         .spawn()
-        .with_context(|| format!("Failed to spawn 'npm run format' for project {}", project_dir.display()))?;
-    let output = child
+        .with_context(|| {
+            format!(
+                "Failed to spawn 'npm run format' for project {}",
+                project_dir.display()
+            )
+        })?
         .wait_with_output()
         .await
-        .with_context(|| format!("Failed to wait for 'npm run format' for project {}", project_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to wait for 'npm run format' for project {}",
+                project_dir.display()
+            )
+        })?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() {
-        if !stdout_str.is_empty() {
-            println!("'npm run format' stdout: {}", stdout_str); // Log any output
+    match output.status.success() {
+        true => {
+            // Log stdout if present
+            if !stdout_str.is_empty() {
+                println!("'npm run format' stdout: {}", stdout_str);
+            }
+
+            // Log stderr as warning/info even on success
+            if !stderr_str.is_empty() {
+                println!("Warning/Info: 'npm run format' stderr: {}", stderr_str);
+            }
+
+            Ok(Vec::new())
         }
-        if !stderr_str.is_empty() {
-            println!("'npm run format' stderr: {}", stderr_str); // Log any stderr even on success
-        }
-        // Cannot reliably return changed files, so return empty Vec.
-        Ok(Vec::new())
-    } else {
-        Err(anyhow!(
-            "'npm run format' failed with status: {}. Stdout: '{}'. Stderr: '{}'",
-            output.status, stdout_str, stderr_str
-        ))
+        false => Err(anyhow!(
+            "'npm run format' execution failed with status {}. Stdout: '{}'. Stderr: '{}'",
+            output.status,
+            stdout_str,
+            stderr_str
+        )),
     }
 }
 
@@ -473,17 +375,16 @@ pub struct LspClient {
 impl LspClient {
     pub async fn new() -> Result<Self> {
         let project_dir = resolver::get_project_root()?;
-        ensure_typescript_language_server_available().await
-            .context("Failed to ensure typescript-language-server is available for LspClient new")?;
+        ensure_dev_deps()
+            .await
+            .context("Failed to ensure development dependencies for LspClient new")?;
 
         let mut cmd = Command::new("npm");
-        cmd.current_dir(&project_dir);
-        cmd.args(&["run", "lsp"]); // The script "lsp": "typescript-language-server --stdio"
-
-        // Stdio setup remains the same
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.current_dir(&project_dir)
+            .args(&["run", "lsp"]) // The script "lsp": "typescript-language-server --stdio"
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         println!(
             "Spawning LSP server via npm script: npm run lsp in {}",
@@ -626,30 +527,34 @@ impl LspClient {
         self.writer
             .flush()
             .await
-            .with_context(|| format!("Failed to flush LSP stdin for RPC: {:?}", rpc));
+            .with_context(|| format!("Failed to flush LSP stdin for RPC: {:?}", rpc))?;
         Ok(())
     }
 
     async fn send_request(&mut self, method: &str, params: Params) -> Result<Id> {
         let id = self.next_request_id();
         let request_obj = JsonRpc::request_with_params(id.clone(), method, params.clone());
-        self.send_rpc(request_obj).await
-            .with_context(|| format!("Failed to send LSP request {} with params {:?}", method, params))?;
+        self.send_rpc(request_obj).await.with_context(|| {
+            format!(
+                "Failed to send LSP request {} with params {:?}",
+                method, params
+            )
+        })?;
         Ok(id)
     }
 
     async fn send_notification(&mut self, method: &str, params: Params) -> Result<()> {
         let notification_obj = JsonRpc::notification_with_params(method, params.clone());
-        self.send_rpc(notification_obj).await
-            .with_context(|| format!("Failed to send LSP notification {} with params {:?}", method, params))?;
+        self.send_rpc(notification_obj).await.with_context(|| {
+            format!(
+                "Failed to send LSP notification {} with params {:?}",
+                method, params
+            )
+        })?;
         Ok(())
     }
 
-    async fn wait_for_response(
-        &mut self,
-        request_id: &Id,
-        timeout_secs: u64,
-    ) -> Result<JsonRpc> {
+    async fn wait_for_response(&mut self, request_id: &Id, timeout_secs: u64) -> Result<JsonRpc> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
         loop {
             match tokio::time::timeout_at(deadline, self.response_rx.recv()).await {
@@ -679,7 +584,7 @@ impl LspClient {
 
     pub async fn initialize(
         &mut self,
-        root_uri: LspUri,
+        root_uri: Uri,
         client_capabilities: ClientCapabilities,
     ) -> Result<lsp_types::InitializeResult> {
         let workspace_folder_path = root_uri.path().to_string();
@@ -718,7 +623,9 @@ impl LspClient {
             .await
             .context("Sending Initialize request to LSP failed")?;
 
-        let response_rpc = self.wait_for_response(&request_id, 10).await
+        let response_rpc = self
+            .wait_for_response(&request_id, 10)
+            .await
             .context("Waiting for Initialize response from LSP failed")?;
 
         // Use get_result() on JsonRpc enum directly
@@ -741,7 +648,7 @@ impl LspClient {
 
     pub async fn notify_did_open(
         &mut self,
-        uri: LspUri,
+        uri: Uri,
         language_id: &str,
         version: i32,
         text: String,
@@ -756,17 +663,14 @@ impl LspClient {
         };
         self.send_notification(
             lsp_types::notification::DidOpenTextDocument::METHOD,
-            Params::from(
-                serde_json::to_value(params)
-                    .context("Serialize DidOpenParams error")?,
-            ),
+            Params::from(serde_json::to_value(params).context("Serialize DidOpenParams error")?),
         )
         .await
     }
 
     pub async fn goto_definition(
         &mut self,
-        uri: LspUri,
+        uri: Uri,
         position: Position,
     ) -> Result<Option<lsp_types::GotoDefinitionResponse>> {
         let params = GotoDefinitionParams {
@@ -788,7 +692,9 @@ impl LspClient {
             .await
             .context("Sending GotoDefinition request to LSP failed")?;
 
-        let response_rpc = self.wait_for_response(&request_id, 5).await
+        let response_rpc = self
+            .wait_for_response(&request_id, 5)
+            .await
             .context("Waiting for GotoDefinition response from LSP failed")?;
 
         // Use get_result() on JsonRpc enum directly

@@ -251,21 +251,9 @@ struct LintResponse {
     results: Vec<watcher::EslintResult>,
 }
 
-// Prettier Check
-#[derive(Debug, Serialize, Deserialize)]
-struct FormatCheckRequest {
-    patterns: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct FormatCheckResponse {
-    unformatted_files: Vec<String>,
-}
-
 // Prettier Write
 #[derive(Debug, Serialize, Deserialize)]
 struct FormatWriteRequest {
-    patterns: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -880,7 +868,7 @@ async fn editor_command_api(
 }
 
 #[handler]
-async fn lint_files_api(Json(_req): Json<LintRequest>) -> Result<Json<LintResponse>, poem::Error> {
+async fn lint_api(Json(_req): Json<LintRequest>) -> Result<Json<LintResponse>, poem::Error> {
     match watcher::run_eslint().await {
         Ok(results) => Ok(Json(LintResponse { results })),
         Err(e) => Err(poem::Error::from_string(
@@ -891,23 +879,10 @@ async fn lint_files_api(Json(_req): Json<LintRequest>) -> Result<Json<LintRespon
 }
 
 #[handler]
-async fn format_check_api(
-    Json(req): Json<FormatCheckRequest>,
-) -> Result<Json<FormatCheckResponse>, poem::Error> {
-    match watcher::check_prettier(&req.patterns).await {
-        Ok(unformatted_files) => Ok(Json(FormatCheckResponse { unformatted_files })),
-        Err(e) => Err(poem::Error::from_string(
-            format!("Error checking with Prettier: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
-
-#[handler]
-async fn format_write_api(
-    Json(req): Json<FormatWriteRequest>,
+async fn format_api(
+    Json(_req): Json<FormatWriteRequest>,
 ) -> Result<Json<FormatWriteResponse>, poem::Error> {
-    match watcher::format_with_prettier(&req.patterns).await {
+    match watcher::run_format().await {
         Ok(formatted_files) => Ok(Json(FormatWriteResponse { formatted_files })),
         Err(e) => Err(poem::Error::from_string(
             format!("Error formatting with Prettier: {}", e),
@@ -1049,9 +1024,8 @@ async fn start_server(host: String, port: u16) -> Result<()> {
         .at("/upsert-embeddings", post(upsert_embeddings_api))
         .at("/build-index", post(build_index_api))
         .at("/editor", post(editor_command_api))
-        .at("/lint", post(lint_files_api))
-        .at("/format-check", post(format_check_api))
-        .at("/format-write", post(format_write_api))
+        .at("/lint", post(lint_api))
+        .at("/format-write", post(format_api))
         .at("/lsp/goto-definition", post(lsp_goto_definition_api))
         .at("/package-json", get(get_package_json_api))
         .with(
