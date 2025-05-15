@@ -415,42 +415,64 @@ impl LspClient {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
-                let mut headers_map = std::collections::HashMap::new();
+                // Main message reading loop
                 let mut content_length: Option<usize> = None;
+                let mut headers_map: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut lines_scanned_for_this_message_headers = 0;
+                const MAX_LINES_TO_SCAN_FOR_HEADERS: usize = 10;
 
+                // Header reading loop
                 loop {
-                    // Header reading loop
+                    if lines_scanned_for_this_message_headers >= MAX_LINES_TO_SCAN_FOR_HEADERS {
+                        if content_length.is_none() {
+                            eprintln!("LSP stdout: Scanned {} lines without finding a Content-Length header.", MAX_LINES_TO_SCAN_FOR_HEADERS);
+                        }
+                        break;
+                    }
+
                     let mut line_buffer = String::new();
                     match reader.read_line(&mut line_buffer).await {
                         Ok(0) => {
-                            eprintln!(
-                                "LSP stdout closed (EOF) while reading headers (from npm run lsp)."
-                            );
-                            return;
+                            // EOF
+                            eprintln!("LSP stdout closed (EOF) while reading headers.");
+                            return; // Exit task
                         }
                         Ok(_) => {
+                            lines_scanned_for_this_message_headers += 1;
                             let trimmed_line = line_buffer.trim();
+
                             if trimmed_line.is_empty() {
-                                break;
-                            } // End of headers
+                                if content_length.is_some() {
+                                    break; // End of headers if Content-Length was found
+                                } else {
+                                    // Empty line before Content-Length, possibly initial noise.
+                                    println!("LSP stdout (skipped initial empty line before Content-Length)");
+                                    continue; // Continue scanning up to MAX_LINES_TO_SCAN_FOR_HEADERS
+                                }
+                            }
 
                             if let Some(len_str) = trimmed_line.strip_prefix("Content-Length: ") {
                                 content_length = len_str.parse::<usize>().ok();
                                 headers_map
                                     .insert("Content-Length".to_string(), len_str.to_string());
-                            } else {
-                                // Store other headers if necessary
+                            } else if trimmed_line.contains(':') {
                                 if let Some((key, value)) = trimmed_line.split_once(": ") {
                                     headers_map.insert(key.to_string(), value.to_string());
                                 }
+                            } else {
+                                println!(
+                                    "LSP stdout (skipped initial non-header line): {}",
+                                    trimmed_line
+                                );
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error reading LSP stdout headers (from npm run lsp): {}", e);
-                            return;
+                            eprintln!("Error reading line for LSP headers: {}", e);
+                            return; // Exit task
                         }
                     }
-                }
+                } // End of header reading loop
 
                 if let Some(len) = content_length {
                     let mut buffer = vec![0; len];
@@ -476,9 +498,21 @@ impl LspClient {
                         }
                     }
                 } else {
-                    eprintln!("LSP message did not contain a valid Content-Length header (from npm run lsp). Headers received: {:?}", headers_map);
+                    // This path is taken if the header loop exited without content_length being set.
+                    if lines_scanned_for_this_message_headers > 0
+                        && (lines_scanned_for_this_message_headers < MAX_LINES_TO_SCAN_FOR_HEADERS
+                            || !headers_map.is_empty())
+                    {
+                        // Avoid logging this if we simply hit MAX_LINES_TO_SCAN_FOR_HEADERS with no useful header info found,
+                        // as that case is already logged above. Only log if we broke for other reasons (e.g. early empty line after some junk)
+                        // or if we scanned fewer than max lines but still failed.
+                        eprintln!(
+                            "LSP message processing did not yield a Content-Length. Headers map: {:?}, Lines scanned: {}",
+                            headers_map, lines_scanned_for_this_message_headers
+                        );
+                    }
                 }
-            }
+            } // End of main message reading loop
         });
 
         // Reader task for stderr
@@ -582,9 +616,10 @@ impl LspClient {
         }
     }
 
+    #[allow(deprecated)] // Suppress warnings for deprecated fields used in InitializeParams
     pub async fn initialize(
         &mut self,
-        root_uri: Uri,
+        root_uri: Uri, // This uri is used to derive workspace_folder.uri
         client_capabilities: ClientCapabilities,
     ) -> Result<lsp_types::InitializeResult> {
         let workspace_folder_path = root_uri.path().to_string();
@@ -602,7 +637,7 @@ impl LspClient {
 
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_uri: Some(root_uri), // This is still technically needed for older LSP versions or specific servers
+            root_uri: None, // Explicitly not sending the deprecated rootUri field in the request
             root_path: None,          // Deprecated in favor of root_uri and workspace_folders
             initialization_options: None,
             capabilities: client_capabilities,
