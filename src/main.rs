@@ -1,12 +1,10 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Use modules
-use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver};
+use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver, debugger};
 
 // Add Poem imports
 use poem::{
@@ -15,121 +13,6 @@ use poem::{
 };
 use serde::{Deserialize, Serialize};
 use lsp_types::Uri;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Find files recursively in a directory by suffix
-    FindFiles {
-        #[arg(long, required = true)]
-        dir: PathBuf,
-        #[arg(long, required = true, value_delimiter = ',')]
-        suffixes: Vec<String>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            default_value = "node_modules,target,dist,build,.git,.vscode,.idea"
-        )]
-        exclude_dirs: Vec<String>,
-    },
-    /// Parse files in a directory and print results as JSON to stdout
-    ParseDirectory {
-        #[arg(long, required = true, default_value = ".")]
-        dir: PathBuf,
-        #[arg(long, required = true, value_delimiter = ',')]
-        suffixes: Vec<String>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            default_value = "node_modules,target,dist,build,.git,.vscode,.idea"
-        )]
-        exclude_dirs: Vec<String>,
-        #[arg(long)]
-        max_snippet_size: Option<usize>,
-        #[arg(long, value_enum, default_value_t = processing::Granularity::Fine)]
-        granularity: processing::Granularity,
-    },
-    /// Generate embeddings for entities in an index JSON file
-    GenerateEmbeddings {
-        #[arg(long, required = true)]
-        input_file: PathBuf,
-        #[arg(long, required = true)]
-        output_file: PathBuf,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        api_key: Option<String>,
-        #[arg(long)]
-        api_base: Option<String>,
-    },
-    /// Upsert embeddings from an index JSON file into a Qdrant collection
-    UpsertEmbeddings {
-        #[arg(long, required = true)]
-        input_file: PathBuf,
-        #[arg(long, required = true)]
-        collection_name: String,
-        #[arg(long, default_value = "http://localhost:6334")]
-        qdrant_url: String,
-    },
-    /// Query a Qdrant collection with a text query
-    Query {
-        #[arg(long, required = true)]
-        collection_name: String,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        api_key: Option<String>,
-        #[arg(long)]
-        api_base: Option<String>,
-        #[arg(long, default_value = "http://localhost:6334")]
-        qdrant_url: String,
-        query_text: String,
-    },
-    /// Build a full index: Find files -> Parse -> Embed -> Store in Qdrant
-    BuildIndex {
-        // Wanderer args
-        #[arg(long, required = true, default_value = ".")]
-        dir: PathBuf,
-        #[arg(long, required = true, value_delimiter = ',')]
-        suffixes: Vec<String>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            default_value = "node_modules,target,dist,build,.git,.vscode,.idea"
-        )]
-        exclude_dirs: Vec<String>,
-        // Processing args
-        #[arg(long)]
-        max_snippet_size: Option<usize>,
-        #[arg(long, value_enum, default_value_t = processing::Granularity::Fine)]
-        granularity: processing::Granularity,
-        // Embedder args
-        #[arg(long)]
-        embedding_model: Option<String>,
-        #[arg(long)]
-        api_key: Option<String>,
-        #[arg(long)]
-        api_base: Option<String>,
-         // Hoarder args
-        #[arg(long, required = true)]
-        collection_name: String,
-        #[arg(long, default_value = "http://localhost:6334")]
-        qdrant_url: String,
-    },
-    /// Start the Galatea web API server
-    StartServer {
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        #[arg(long, default_value = "3051")]
-        port: u16,
-    },
-}
 
 // API request/response types
 #[derive(Debug, Serialize, Deserialize)]
@@ -251,14 +134,28 @@ struct LintResponse {
     results: Vec<watcher::EslintResult>,
 }
 
+// New response struct for lint status
+#[derive(Debug, Serialize, Deserialize)]
+struct LintStatusResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<watcher::EslintResult>>,
+}
+
 // Prettier Write
 #[derive(Debug, Serialize, Deserialize)]
 struct FormatWriteRequest {
 }
 
+// New response struct for format status
 #[derive(Debug, Serialize, Deserialize)]
-struct FormatWriteResponse {
-    formatted_files: Vec<String>,
+struct FormatStatusResponse {
+    success: bool,
+    message: String,
+    // Optionally, could add a field for details if watcher::run_format ever returns more info
+    // formatted_files: Option<Vec<String>>, 
 }
 
 // LSP - Goto Definition
@@ -283,31 +180,10 @@ async fn health() -> &'static str {
 }
 
 #[handler]
-async fn get_package_json_api() -> Result<Json<watcher::PackageJsonData>, poem::Error> {
-    match watcher::parse_package_json().await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => {
-            // Determine if the error is due to file not found or parsing error for status code
-            if e.to_string().contains("package.json not found") {
-                Err(poem::Error::from_string(
-                    format!("Error getting package.json: {}", e),
-                    StatusCode::NOT_FOUND, // 404 if not found
-                ))
-            } else {
-                Err(poem::Error::from_string(
-                    format!("Error parsing package.json: {}", e),
-                    StatusCode::INTERNAL_SERVER_ERROR, // 500 for other errors like parsing
-                ))
-            }
-        }
-    }
-}
-
-#[handler]
 async fn find_files(
     Json(req): Json<FindFilesRequest>,
 ) -> Result<Json<FindFilesResponse>, poem::Error> {
-    let dir = PathBuf::from(&req.dir);
+    let dir = std::path::PathBuf::from(&req.dir);
     let suffixes_ref: Vec<&str> = req.suffixes.iter().map(|s| s.as_str()).collect();
     let exclude_dirs = req.exclude_dirs.unwrap_or_else(|| {
         vec![
@@ -380,7 +256,7 @@ async fn parse_file(
 async fn parse_directory(
     Json(req): Json<ParseDirectoryRequest>,
 ) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    let dir = PathBuf::from(&req.dir);
+    let dir = std::path::PathBuf::from(&req.dir);
     let suffixes_ref: Vec<&str> = req.suffixes.iter().map(|s| s.as_str()).collect();
     let exclude_dirs = req.exclude_dirs.unwrap_or_else(|| {
         vec![
@@ -477,8 +353,8 @@ async fn generate_embeddings_api(
         "API request to generate embeddings: input='{}', output='{}'",
         req.input_file, req.output_file
     );
-    let input_path = PathBuf::from(&req.input_file);
-    let output_path = PathBuf::from(&req.output_file);
+    let input_path = std::path::PathBuf::from(&req.input_file);
+    let output_path = std::path::PathBuf::from(&req.output_file);
 
     if !input_path.exists() {
         return Err(poem::Error::from_string(
@@ -519,7 +395,7 @@ async fn upsert_embeddings_api(
         "API request to upsert embeddings: input='{}', collection='{}'", 
         req.input_file, req.collection_name
     );
-    let input_path = PathBuf::from(&req.input_file);
+    let input_path = std::path::PathBuf::from(&req.input_file);
     let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
 
     if !input_path.exists() {
@@ -586,7 +462,7 @@ async fn build_index_api(
     // so the HTTP request can return quickly.
     tokio::spawn(async move {
         let qdrant_url_inner = qdrant_url_for_spawn; // Use the URL captured for the spawn
-        let dir_path = PathBuf::from(dir_clone); // Use cloned data
+        let dir_path = std::path::PathBuf::from(dir_clone); // Use cloned data
         let suffixes_ref: Vec<&str> = suffixes_clone.iter().map(|s| s.as_str()).collect();
         
         let default_exclude_dirs = vec![
@@ -868,9 +744,23 @@ async fn editor_command_api(
 }
 
 #[handler]
-async fn lint_api(Json(_req): Json<LintRequest>) -> Result<Json<LintResponse>, poem::Error> {
+async fn lint_api(Json(_req): Json<LintRequest>) -> Result<Json<LintStatusResponse>, poem::Error> {
     match watcher::run_eslint().await {
-        Ok(results) => Ok(Json(LintResponse { results })),
+        Ok(results) => {
+            if results.is_empty() {
+                Ok(Json(LintStatusResponse {
+                    success: true,
+                    message: Some("No lint errors found.".to_string()),
+                    results: None,
+                }))
+            } else {
+                Ok(Json(LintStatusResponse {
+                    success: true,
+                    message: Some(format!("{} lint issue(s) found.", results.len())),
+                    results: Some(results),
+                }))
+            }
+        }
         Err(e) => Err(poem::Error::from_string(
             format!("Error running ESLint: {}", e),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -881,9 +771,14 @@ async fn lint_api(Json(_req): Json<LintRequest>) -> Result<Json<LintResponse>, p
 #[handler]
 async fn format_api(
     Json(_req): Json<FormatWriteRequest>,
-) -> Result<Json<FormatWriteResponse>, poem::Error> {
+) -> Result<Json<FormatStatusResponse>, poem::Error> {
     match watcher::run_format().await {
-        Ok(formatted_files) => Ok(Json(FormatWriteResponse { formatted_files })),
+        Ok(_formatted_files) => {
+            Ok(Json(FormatStatusResponse {
+                success: true,
+                message: "Formatting process completed successfully.".to_string(),
+            }))
+        }
         Err(e) => Err(poem::Error::from_string(
             format!("Error formatting with Prettier: {}", e),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -898,7 +793,7 @@ async fn lsp_goto_definition_api(
 ) -> Result<Json<GotoDefinitionApiResponse>, poem::Error> {
     // 1. Resolve the input string (which could be a URI string or a partial path)
     //    to a canonical PathBuf using the resolver module.
-    let resolved_file_path: PathBuf = match resolver::resolve_path(&req.uri) {
+    let resolved_file_path: std::path::PathBuf = match resolver::resolve_path(&req.uri) {
         Ok(p) => p,
         Err(e) => { // e is anyhow::Error
             return Err(poem::Error::from_string(
@@ -977,7 +872,7 @@ async fn lsp_goto_definition_api(
     }
 }
 
-async fn start_server(host: String, port: u16) -> Result<()> {
+async fn start_server(host: &str, port: u16) -> Result<()> {
     let editor_state = Arc::new(Mutex::new(editor::Editor::new()));
 
     let lsp_client = match watcher::LspClient::new().await {
@@ -1027,7 +922,6 @@ async fn start_server(host: String, port: u16) -> Result<()> {
         .at("/lint", post(lint_api))
         .at("/format-write", post(format_api))
         .at("/lsp/goto-definition", post(lsp_goto_definition_api))
-        .at("/package-json", get(get_package_json_api))
         .with(
             Cors::new()
             .allow_credentials(true)
@@ -1055,299 +949,19 @@ async fn start_server(host: String, port: u16) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    // Use a default command if none was provided
-    match args.command {
-        Some(cmd) => match cmd {
-            Commands::FindFiles {
-                dir,
-                suffixes,
-                exclude_dirs,
-            } => {
-                let suffixes_ref: Vec<&str> = suffixes.iter().map(|s| s.as_str()).collect();
-                let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-                println!(
-                    "Searching for files with suffixes [{}] in: {} (excluding: [{}])",
-                    suffixes.join(", "),
-                    dir.display(),
-                    exclude_dirs.join(", ")
-                );
-                match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
-                    Ok(found_files) => {
-                        if found_files.is_empty() {
-                            println!("No matching files found.");
-                        } else {
-                            println!("Found files:");
-                            for file_path in found_files {
-                                println!("  {}", file_path.display());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error searching directory {}: {}", dir.display(), e);
-                        return Err(e);
-                    }
-                }
-            }
-            Commands::ParseDirectory {
-                dir,
-                suffixes,
-                exclude_dirs,
-                max_snippet_size,
-                granularity,
-            } => {
-                let suffixes_ref: Vec<&str> = suffixes.iter().map(|s| s.as_str()).collect();
-                let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-
-                println!(
-                    "Starting parsing in '{}' for suffixes: {:?} (excluding: {:?})",
-                    dir.display(),
-                    suffixes,
-                    exclude_dirs
-                );
-                let files_to_parse =
-                    wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref)?;
-                if files_to_parse.is_empty() {
-                    println!("No matching files found to parse.");
-                    return Ok(());
-                }
-                println!("Found {} files to process.", files_to_parse.len());
-
-                let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
-                for file_path in files_to_parse {
-                    println!("  Parsing: {}", file_path.display());
-                    let extension = file_path.extension().and_then(|ext| ext.to_str());
-                    let parse_result = match extension {
-                        Some("rs") => parser_mod::extract_rust_entities_from_file(
-                            &file_path,
-                            max_snippet_size,
-                        ),
-                        Some("ts") => {
-                            parser_mod::extract_ts_entities(&file_path, false, max_snippet_size)
-                        }
-                        Some("tsx") => {
-                            parser_mod::extract_ts_entities(&file_path, true, max_snippet_size)
-                        }
-                        _ => {
-                            println!("  -> Skipping file with unsupported extension.");
-                            continue;
-                        }
-                    };
-                    match parse_result {
-                        Ok(entities) => {
-                            println!("    -> Extracted {} entities.", entities.len());
-                            all_entities.extend(entities);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "    -> Error parsing {}: {}. Skipping file.",
-                                file_path.display(),
-                                e
-                            );
-                        }
-                    }
-                }
-                println!(
-                    "Total entities extracted before post-processing: {}",
-                    all_entities.len()
-                );
-
-                let final_entities =
-                    processing::post_process_entities(all_entities, granularity, max_snippet_size);
-                println!(
-                    "Total entities after post-processing: {}",
-                    final_entities.len()
-                );
-
-                let json_output = serde_json::to_string_pretty(&final_entities)?;
-                println!("\n--- Start JSON Output ---");
-                println!("{}", json_output);
-                println!("--- End JSON Output ---");
-            }
-            Commands::GenerateEmbeddings {
-                input_file,
-                output_file,
-                model,
-                api_key,
-                api_base,
-            } => {
-                if let Err(e) = embedder::generate_embeddings_for_index(
-                    &input_file,
-                    &output_file,
-                    model,
-                    api_key,
-                    api_base,
-                )
-                .await
-                {
-                    eprintln!("Failed to generate embeddings: {}", e);
-                    return Err(e);
-                }
-            }
-            Commands::UpsertEmbeddings {
-                input_file,
-                collection_name,
-                qdrant_url,
-            } => {
-                hoarder::create_collection(&collection_name, &qdrant_url).await?;
-                if let Err(e) =
-                    hoarder::upsert_embeddings(&collection_name, &input_file, &qdrant_url).await
-                {
-                    eprintln!("Failed to upsert embeddings from file: {}", e);
-                    return Err(e);
-                }
-                println!("Upsert from file complete.");
-            }
-            Commands::Query {
-                collection_name,
-                query_text,
-                model,
-                api_key,
-                api_base,
-                qdrant_url,
-            } => {
-                println!(
-                    "Querying collection '{}' with: \"{}\" using Qdrant at {}",
-                    collection_name, query_text, qdrant_url
-                );
-                if let Err(e) = hoarder::query(
-                    &collection_name,
-                    &query_text,
-                    model,
-                    api_key,
-                    api_base,
-                    &qdrant_url,
-                )
-                .await
-                {
-                    eprintln!("Failed to execute query: {}", e);
-                    return Err(e);
-                }
-            }
-            Commands::BuildIndex {
-                dir,
-                suffixes,
-                exclude_dirs,
-                granularity,
-                max_snippet_size,
-                embedding_model,
-                api_key,
-                api_base,
-                collection_name,
-                qdrant_url,
-            } => {
-                println!(
-                    "--- Starting Full Index Build (Qdrant at: {}) ---",
-                    qdrant_url
-                );
-
-                println!("[1/4] Finding files...");
-                let suffixes_ref: Vec<&str> = suffixes.iter().map(|s| s.as_str()).collect();
-                let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-                let files_to_parse =
-                    wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref)
-                        .with_context(|| {
-                            format!("Wander step failed in dir '{}'", dir.display())
-                        })?;
-                if files_to_parse.is_empty() {
-                    println!("No matching files found. Index build cancelled.");
-                    return Ok(());
-                }
-                println!("Found {} files.", files_to_parse.len());
-
-                println!("[2/4] Parsing files...");
-                let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
-                for file_path in files_to_parse {
-                    let extension = file_path.extension().and_then(|ext| ext.to_str());
-                    let parse_result = match extension {
-                        Some("rs") => parser_mod::extract_rust_entities_from_file(
-                            &file_path,
-                            max_snippet_size,
-                        ),
-                        Some("ts") => {
-                            parser_mod::extract_ts_entities(&file_path, false, max_snippet_size)
-                        }
-                        Some("tsx") => {
-                            parser_mod::extract_ts_entities(&file_path, true, max_snippet_size)
-                        }
-                        _ => {
-                            continue;
-                        }
-                    };
-                    match parse_result {
-                        Ok(entities) => all_entities.extend(entities),
-                        Err(e) => eprintln!(
-                            "    -> Error parsing {}: {}. Skipping.",
-                            file_path.display(),
-                            e
-                        ),
-                    }
-                }
-                println!("Parsed {} initial entities.", all_entities.len());
-
-                println!(
-                    "[2b/4] Post-processing entities (granularity: {:?})...",
-                    granularity
-                );
-                let processed_entities =
-                    processing::post_process_entities(all_entities, granularity, max_snippet_size);
-                println!(
-                    "{} entities after post-processing.",
-                    processed_entities.len()
-                );
-                if processed_entities.is_empty() {
-                    println!("No entities after processing. Index build cancelled.");
-                    return Ok(());
-                }
-
-                println!("[3/4] Generating embeddings...");
-                let entities_with_embeddings = embedder::generate_embeddings_for_vec(
-                    processed_entities,
-                    embedding_model.clone(),
-                    api_key.clone(),
-                    api_base.clone(),
-                )
-                .await
-                .context("Embedding step failed")?;
-                println!("Embeddings generated.");
-                if entities_with_embeddings
-                    .iter()
-                    .all(|e| e.embedding.is_none())
-                {
-                    println!("Warning: No entities had embeddings generated successfully. Check API key/quota/connectivity.");
-                    println!("Index build finished without storing to Qdrant.");
-                    return Ok(());
-                }
-
-                println!(
-                    "[4/4] Storing embeddings in Qdrant collection '{}'...",
-                    collection_name
-                );
-                hoarder::create_collection(&collection_name, &qdrant_url)
-                    .await
-                    .context("Failed to ensure Qdrant collection exists")?;
-                hoarder::upsert_entities_from_vec(
-                    &collection_name,
-                    entities_with_embeddings,
-                    &qdrant_url,
-                )
-                .await
-                .context("Upserting embeddings to Qdrant failed")?;
-
-                println!("--- Index Build Complete ---");
-            }
-            Commands::StartServer { host, port } => {
-                start_server(host, port).await?;
-            }
-        },
-        None => {
-            // Default to starting the server with default parameters when no command is provided
-            println!("No command specified, starting server with default settings on port 3051...");
-            // Use default host and new default port 3051
-            start_server("0.0.0.0".to_string(), 3051).await?;
-        }
+    
+    // Verify and set up the project environment using the debugger module
+    if let Err(e) = debugger::verify_and_setup_project().await {
+        eprintln!("Failed to verify and set up the project environment: {:?}", e);
+        eprintln!("Please check the errors above. Server will not start.");
+        return Err(e); 
     }
-
-    Ok(())
+    println!("Project environment verified and set up successfully.");
+    
+    // Default server settings
+    let host = "0.0.0.0";
+    let port = 3051;
+    
+    println!("Starting server with default settings on {}:{}...", host, port);
+    start_server(host, port).await
 }

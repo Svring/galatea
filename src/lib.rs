@@ -8,3 +8,4 @@ pub mod processing;
 pub mod wanderer;
 pub mod watcher;
 pub mod resolver;
+pub mod debugger;

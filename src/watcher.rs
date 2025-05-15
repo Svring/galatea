@@ -20,169 +20,6 @@ use lsp_types::{
 
 use crate::resolver;
 
-// --- Project and Dependency Management ---
-
-async fn run_npm_command(project_dir: &Path, args: &[&str], suppress_output: bool) -> Result<()> {
-    let mut cmd = Command::new("npm");
-    cmd.current_dir(project_dir);
-    cmd.args(args);
-
-    // Configure stdout/stderr based on suppress_output flag
-    match suppress_output {
-        true => {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-        }
-        false => {
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-        }
-    }
-
-    println!(
-        "Running command: npm {} in {}",
-        args.join(" "),
-        project_dir.display()
-    );
-
-    let child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to spawn npm command (npm {}). Ensure npm is installed and in PATH.",
-            args.join(" ")
-        )
-    })?;
-
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("Failed to wait for npm command: npm {}", args.join(" ")))?;
-
-    match output.status.success() {
-        true => {
-            // Only print stdout if not suppressing output and stdout is not empty
-            if !suppress_output {
-                let stdout_data = String::from_utf8_lossy(&output.stdout);
-                if !stdout_data.is_empty() {
-                    println!("npm stdout:\n{}", stdout_data);
-                }
-            }
-            Ok(())
-        }
-        false => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout); // stdout might also contain error info for npm
-            Err(anyhow!(
-                "npm command failed with status: {}.\nCommand: npm {}\nStderr: {}\nStdout: {}",
-                output.status,
-                args.join(" "),
-                stderr,
-                stdout
-            ))
-        }
-    }
-}
-
-// Merged function to ensure core development dependencies are available
-pub async fn ensure_dev_deps() -> Result<()> {
-    let project_dir = resolver::get_project_root()?;
-    let dev_dependencies_to_ensure = [
-        "prettier",
-        "typescript-language-server",
-        "typescript", // Peer dependency for typescript-language-server
-    ];
-
-    for tool_name in dev_dependencies_to_ensure.iter() {
-        let bin_path = project_dir
-            .join("node_modules")
-            .join(".bin")
-            .join(tool_name);
-        let package_path = project_dir.join("node_modules").join(tool_name);
-
-        match bin_path.exists() || package_path.exists() {
-            false => {
-                println!(
-                    "Development dependency '{}' not found locally. Attempting to install...",
-                    tool_name
-                );
-                run_npm_command(
-                    &project_dir,
-                    &["install", "--loglevel", "error", "--save-dev", tool_name],
-                    true, // suppress_output
-                )
-                .await
-                .with_context(|| format!("Failed to install npm tool '{}'", tool_name))?;
-                println!(
-                    "Development dependency '{}' installed successfully.",
-                    tool_name
-                );
-            }
-            true => {
-                println!(
-                    "Development dependency '{}' is already installed locally in the project.",
-                    tool_name
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-// --- package.json Parsing ---
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct PackageJsonData {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub scripts: std::collections::HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub dependencies: std::collections::HashMap<String, String>,
-    #[serde(
-        default,
-        rename = "devDependencies",
-        skip_serializing_if = "std::collections::HashMap::is_empty"
-    )]
-    pub dev_dependencies: std::collections::HashMap<String, String>,
-    // Add other common fields if desired, e.g.:
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub main: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<String>, // Can be String or a struct
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
-}
-
-pub async fn parse_package_json() -> Result<PackageJsonData> {
-    let project_dir = resolver::get_project_root()?;
-    let package_json_path = project_dir.join("package.json");
-
-    if !package_json_path.exists() {
-        return Err(anyhow!(
-            "package.json not found in project directory: {}",
-            project_dir.display()
-        ));
-    }
-
-    let content = std::fs::read_to_string(&package_json_path).with_context(|| {
-        format!(
-            "Failed to read package.json from {}",
-            package_json_path.display()
-        )
-    })?;
-
-    serde_json::from_str::<PackageJsonData>(&content).with_context(|| {
-        format!(
-            "Failed to parse package.json content from {}\nContent: {}",
-            package_json_path.display(),
-            content
-        )
-    })
-}
-
 // --- Linter (ESLint) Interaction ---
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -217,9 +54,6 @@ pub struct EslintResult {
 
 pub async fn run_eslint() -> Result<Vec<EslintResult>> {
     let project_dir = resolver::get_project_root()?;
-    ensure_dev_deps()
-        .await
-        .context("Failed to ensure development dependencies for ESLint")?;
 
     let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir)
@@ -305,9 +139,6 @@ pub async fn run_eslint() -> Result<Vec<EslintResult>> {
 
 pub async fn run_format() -> Result<Vec<String>> {
     let project_dir = resolver::get_project_root()?;
-    ensure_dev_deps()
-        .await
-        .context("Failed to ensure development dependencies for Prettier format")?;
 
     let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir)
@@ -375,9 +206,6 @@ pub struct LspClient {
 impl LspClient {
     pub async fn new() -> Result<Self> {
         let project_dir = resolver::get_project_root()?;
-        ensure_dev_deps()
-            .await
-            .context("Failed to ensure development dependencies for LspClient new")?;
 
         let mut cmd = Command::new("npm");
         cmd.current_dir(&project_dir)
@@ -593,11 +421,62 @@ impl LspClient {
         loop {
             match tokio::time::timeout_at(deadline, self.response_rx.recv()).await {
                 Ok(Some(response_candidate)) => {
-                    if response_candidate.get_id() == Some(request_id.clone()) {
-                        return Ok(response_candidate);
-                    } else {
-                        // Log or handle other messages (notifications, other responses)
-                        println!("LSP Client: Received non-matching or notification message while waiting for {:?}: {:?}", request_id, response_candidate);
+                    match response_candidate.get_id() {
+                        Some(id) if id == request_id.clone() => {
+                            return Ok(response_candidate);
+                        }
+                        Some(other_id) => {
+                            // It has an ID, but it's not the one we're waiting for
+                            response_candidate.get_method()
+                                .map_or_else(
+                                    || {
+                                        // Likely a response (Success or Error) to a different client-initiated request
+                                        println!(
+                                            "LSP Client: Received response for a different ID ({:?}) while waiting for ID {:?}. Full message: {:?}",
+                                            other_id, request_id, response_candidate
+                                        );
+                                    },
+                                    |method| {
+                                        println!(
+                                            "LSP Client: Received a SERVER REQUEST (Method: {}, ID: {:?}) while waiting for response to ID {:?}. This is unexpected while polling for a specific response.",
+                                            method, other_id, request_id
+                                        );
+                                    }
+                                );
+                        }
+                        None => {
+                            // No ID typically means it's a Notification
+                            let method_name = response_candidate
+                                .get_method()
+                                .unwrap_or("[unknown_method]");
+                            
+                            // Get detailed params representation
+                            let params_detail = response_candidate.get_params().map_or(
+                                "[no_params]".to_string(),
+                                |params| match params {
+                                    Params::Array(arr) => {
+                                        let items = arr.iter()
+                                            .map(|v| format!("{:?}", v))
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        format!("Array([{}])", items)
+                                    },
+                                    Params::Map(map) => {
+                                        let items = map.iter()
+                                            .map(|(k, v)| format!("{}: {:?}", k, v))
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        format!("Map({{ {} }})", items)
+                                    },
+                                    Params::None(_) => "None".to_string(),
+                                },
+                            );
+
+                            println!(
+                                "LSP Client: Received notification (Method: {}) while waiting for response to ID {:?}.\nParams: {}",
+                                method_name, request_id, params_detail
+                            );
+                        }
                     }
                 }
                 Ok(None) => {
@@ -638,7 +517,7 @@ impl LspClient {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: None, // Explicitly not sending the deprecated rootUri field in the request
-            root_path: None,          // Deprecated in favor of root_uri and workspace_folders
+            root_path: None, // Deprecated in favor of root_uri and workspace_folders
             initialization_options: None,
             capabilities: client_capabilities,
             trace: None,
