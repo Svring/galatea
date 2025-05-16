@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-// use http::StatusCode; // Not used after simplification
+use tracing::{debug, error, info, warn};
 
 // Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
@@ -40,7 +40,7 @@ pub async fn generate_embeddings(
     api_base: Option<String>,
 ) -> Result<Vec<CodeEntity>> {
     if entities.is_empty() {
-        println!("No entities provided. Nothing to embed.");
+        info!(target: "galatea::embedder", "No entities provided. Nothing to embed.");
         return Ok(entities);
     }
     // No need to load from file
@@ -61,7 +61,7 @@ pub async fn generate_embeddings(
     if entities.iter().any(|e| e.embedding.is_none()) { 
         let client = OpenAIClient::with_config(config);
         let model = model_name.unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-        println!("Generating embeddings for {} entities using model: {}", entities.len(), model);
+        info!(target: "galatea::embedder", count = entities.len(), model_name = %model, "Generating embeddings for entities");
 
         // 3. Prepare data and generate embeddings concurrently with retry logic
         let results = stream::iter(entities.iter_mut())
@@ -101,12 +101,7 @@ pub async fn generate_embeddings(
                     backoff_strategy.max_elapsed_time = Some(Duration::from_secs(MAX_RETRY_DURATION_SECONDS));
 
                     let notify = |err: OpenAIError, dur: Duration| {
-                        eprintln!(
-                            "Rate limit error for entity '{}'. Retrying in {:?}. Error: {}",
-                            entity_name,
-                            dur,
-                            err
-                        );
+                        warn!(target: "galatea::embedder", entity_name = %entity_name, retry_duration = ?dur, error = ?err, "Rate limit error. Retrying.");
                     };
 
                     // Execute with retry
@@ -115,17 +110,12 @@ pub async fn generate_embeddings(
                             if let Some(embedding_data) = res.data.into_iter().next() {
                                 Ok((entity, Some(embedding_data.embedding)))
                             } else {
-                                eprintln!("Warning: No embedding data received for entity '{}'", entity_name);
+                                warn!(target: "galatea::embedder", entity_name = %entity_name, "No embedding data received");
                                 Ok((entity, None))
                             }
                         }
                         Err(err) => {
-                            // Handle final error after retries (Permanent or Timeout)
-                            eprintln!(
-                                "Warning: Failed to get embedding for entity '{}' after retries: {}. Skipping.",
-                                entity_name,
-                                err // Log the wrapped error
-                            );
+                            error!(target: "galatea::embedder", entity_name = %entity_name, error = %err, "Failed to get embedding after retries. Skipping.");
                             Ok((entity, None)) // Treat final failure as skippable for this entity
                         }
                     } // End of match retry_notify
@@ -145,15 +135,15 @@ pub async fn generate_embeddings(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Embedding processing error (request build failed): {}", e);
+                    error!(target: "galatea::embedder", error = ?e, "Embedding processing error (request build failed)");
                     build_errors += 1;
                 }
             }
         }
-        if build_errors > 0 { println!("Warning: {} errors encountered during embedding request building.", build_errors); }
-        println!("Embedding generation finished.");
+        if build_errors > 0 { warn!(target: "galatea::embedder", count = build_errors, "Errors encountered during embedding request building."); }
+        info!(target: "galatea::embedder", "Embedding generation finished.");
     } else {
-         println!("All entities already have embeddings. Skipping generation.");
+         info!(target: "galatea::embedder", "All entities already have embeddings. Skipping generation.");
     }
 
     // No need to serialize or save - return the modified vector
@@ -199,12 +189,7 @@ async fn get_embedding_with_retry(
     backoff_strategy.max_elapsed_time = Some(Duration::from_secs(MAX_RETRY_DURATION_SECONDS));
 
     let notify = |err: OpenAIError, dur: Duration| {
-        eprintln!(
-            "Rate limit error for entity '{}'. Retrying in {:?}. Error: {}",
-            entity_name,
-            dur,
-            err
-        );
+        warn!(target: "galatea::embedder", entity_name = %entity_name, retry_duration = ?dur, error = ?err, "Rate limit error for get_embedding_with_retry. Retrying.");
     };
 
     match retry_notify(backoff_strategy, operation, notify).await {
@@ -212,16 +197,12 @@ async fn get_embedding_with_retry(
             if let Some(embedding_data) = res.data.into_iter().next() {
                 Ok(Some(embedding_data.embedding))
             } else {
-                eprintln!("Warning: No embedding data received for entity '{}'", entity_name);
+                warn!(target: "galatea::embedder", entity_name = %entity_name, "No embedding data received (get_embedding_with_retry).");
                 Ok(None)
             }
         }
         Err(e) => {
-            eprintln!(
-                "Warning: Failed to get embedding for entity '{}' after retries: {}. Skipping.",
-                entity_name,
-                e
-            );
+            error!(target: "galatea::embedder", entity_name = %entity_name, error = %e, "Failed to get embedding after retries (get_embedding_with_retry). Skipping.");
             Err(anyhow::anyhow!("Failed to get embedding for entity '{}': {}", entity_name, e))
         },
     }
@@ -245,7 +226,7 @@ async fn generate_embeddings_core(
         }
         // If no entities need embedding, we can return early without a client.
         if !entities.iter().any(|e| e.embedding.is_none() && !e.context.snippet.trim().is_empty()) {
-            println!("All entities already have embeddings or snippets are empty. Skipping generation.");
+            info!(target: "galatea::embedder", "All entities already have embeddings or snippets are empty. Skipping generation (core).");
             return Ok(entities);
         }
     }
@@ -273,10 +254,10 @@ async fn generate_embeddings_core(
     }
     
     if futures_to_run.is_empty() {
-        println!("No entities require embedding generation.");
+        info!(target: "galatea::embedder", "No entities require embedding generation.");
         return Ok(entities);
     }
-    println!("Generating embeddings for {} entities using model: {}", futures_to_run.len(), model);
+    info!(target: "galatea::embedder", count = futures_to_run.len(), model_name = %model, "Generating embeddings for entities (core)");
 
     let results = join_all(futures_to_run).await;
     let mut update_count = 0;
@@ -293,12 +274,12 @@ async fn generate_embeddings_core(
             }
             Err(e) => {
                 // Error already logged by map_embedding_error or get_embedding_with_retry
-                eprintln!("Final error for entity '{}': {}. Embedding not updated.", entities[entity_index].name, e);
+                error!(target: "galatea::embedder", entity_name = %entities[entity_index].name, error = %e, "Final error for entity. Embedding not updated.");
             }
         }
     }
     
-    println!("Embedding generation finished. Updated {} entities.", update_count);
+    info!(target: "galatea::embedder", count = update_count, "Embedding generation finished. Updated entities.");
     Ok(entities)
 }
 
@@ -310,13 +291,14 @@ pub async fn generate_embeddings_for_index(
     api_key: Option<String>,
     api_base: Option<String>,
 ) -> Result<()> {
-    println!("Loading entities from: {}", input_path.display());
+    info!(target: "galatea::embedder", input_path = %input_path.display(), output_path = %output_path.display(), "Starting embedding generation for file index.");
+
     let input_json = fs::read_to_string(input_path)
         .with_context(|| format!("Failed to read input file: {}", input_path.display()))?;
     let entities_vec: Vec<CodeEntity> = serde_json::from_str(&input_json)
         .with_context(|| format!("Failed to deserialize input JSON from: {}", input_path.display()))?;
     if entities_vec.is_empty() { 
-        println!("No entities found in input file.");
+        info!(target: "galatea::embedder", "No entities found in input file.");
         return Ok(()); 
     }
 
@@ -329,13 +311,13 @@ pub async fn generate_embeddings_for_index(
 
     let output_json = serde_json::to_string_pretty(&entities_with_embeddings)
         .context("Failed to serialize updated entities to JSON")?;
-    println!("Saving updated entities to: {}", output_path.display());
+    info!(target: "galatea::embedder", output_path = %output_path.display(), "Saving updated entities to file.");
     let mut file = fs::File::create(output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
     file.write_all(output_json.as_bytes())
         .with_context(|| format!("Failed to write to output file: {}", output_path.display()))?;
 
-    println!("Embedding process complete.");
+    info!(target: "galatea::embedder", output_path = %output_path.display(), "Embedding process complete.");
     Ok(())
 }
 
@@ -346,6 +328,7 @@ pub async fn generate_embeddings_for_vec(
     api_key: Option<String>,
     api_base: Option<String>,
 ) -> Result<Vec<CodeEntity>> {
+    info!(target: "galatea::embedder", "Generating embeddings for a vector of CodeEntity objects.");
     generate_embeddings_core(entities, model_name, api_key, api_base).await
 } 
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -19,6 +20,7 @@ use lsp_types::{
 };
 
 use crate::resolver;
+use crate::logging::{self, LogLevel, LogSource};
 
 // --- Linter (ESLint) Interaction ---
 
@@ -54,17 +56,15 @@ pub struct EslintResult {
 
 pub async fn run_eslint() -> Result<Vec<EslintResult>> {
     let project_dir = resolver::get_project_root()?;
+    let msg_start = format!("Running ESLint in {}", project_dir.display());
+    logging::add_log_entry(LogSource::WatcherEslint, LogLevel::Info, msg_start.clone());
+    tracing::info!(target: "galatea::watcher::eslint", source_process = "eslint_runner", "{}", msg_start);
 
     let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir)
         .args(["run", "lint"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
-    println!(
-        "Running ESLint via npm script: npm run lint in {}",
-        project_dir.display()
-    );
 
     let output = cmd
         .spawn()
@@ -89,11 +89,12 @@ pub async fn run_eslint() -> Result<Vec<EslintResult>> {
     match serde_json::from_str::<Vec<EslintResult>>(&stdout_str) {
         Ok(results) => {
             // JSON parsing successful
+            let log_msg = format!("ESLint completed. Found {} errors, {} warnings. Stderr (if any): {}", results.iter().map(|r| r.error_count).sum::<usize>(), results.iter().map(|r| r.warning_count).sum::<usize>(), stderr_str);
+            logging::add_log_entry(LogSource::WatcherEslint, if output.status.success() { LogLevel::Info } else { LogLevel::Warn }, log_msg);
             if !output.status.success() {
-                eprintln!(
-                    "ESLint command 'npm run lint' failed with status {}, but valid JSON output was parsed. Using JSON results. Stderr: '{}'",
-                    output.status, stderr_str
-                );
+                tracing::warn!(target: "galatea::watcher::eslint", source_process = "eslint_runner", 
+                               "ESLint command failed with status {}, but valid JSON output was parsed. Using JSON results. Stderr: '{}'", 
+                               output.status, stderr_str);
             }
             Ok(results)
         }
@@ -101,7 +102,6 @@ pub async fn run_eslint() -> Result<Vec<EslintResult>> {
             // JSON parsing failed, treat output as plain text
             match output.status.success() {
                 true => {
-                    // Command succeeded. Check for known plain text success messages or empty output.
                     let trimmed_stdout = stdout_str.trim();
                     let is_success_message = trimmed_stdout.is_empty()
                         || [
@@ -112,23 +112,30 @@ pub async fn run_eslint() -> Result<Vec<EslintResult>> {
                         .iter()
                         .any(|msg| trimmed_stdout.contains(msg));
 
-                    if is_success_message {
-                        println!("ESLint command 'npm run lint' succeeded. Output was plain text indicating no issues (or empty).");
+                    let log_msg = if is_success_message {
+                        "ESLint command succeeded. Output was plain text indicating no issues (or empty).".to_string()
                     } else {
-                        // Command succeeded, but output is unrecognized plain text.
-                        println!(
-                            "Warning: ESLint command 'npm run lint' succeeded, but its plain text output was not a known success message and not JSON. Assuming no parseable lint issues. Stdout: '{}'",
+                        format!(
+                            "ESLint command succeeded, but its plain text output was not a known success message and not JSON. Assuming no parseable lint issues. Stdout: '{}'", 
                             stdout_str
-                        );
+                        )
+                    };
+                    logging::add_log_entry(LogSource::WatcherEslint, LogLevel::Info, log_msg.clone());
+
+                    if is_success_message {
+                        tracing::info!(target: "galatea::watcher::eslint", source_process = "eslint_runner", "{}", log_msg);
+                    } else {
+                        tracing::warn!(target: "galatea::watcher::eslint", source_process = "eslint_runner", "{}", log_msg);
                     }
                     Ok(Vec::new())
                 }
                 false => {
-                    // Command failed, and output was not JSON.
-                    Err(anyhow!(
+                    let err_msg = format!(
                         "'npm run lint' execution failed with status {}. Output was not parseable as JSON. Stdout: '{}'. Stderr: '{}'",
                         output.status, stdout_str, stderr_str
-                    ))
+                    );
+                    logging::add_log_entry(LogSource::WatcherEslint, LogLevel::Error, err_msg.clone());
+                    Err(anyhow!(err_msg))
                 }
             }
         }
@@ -139,17 +146,15 @@ pub async fn run_eslint() -> Result<Vec<EslintResult>> {
 
 pub async fn run_format() -> Result<Vec<String>> {
     let project_dir = resolver::get_project_root()?;
+    let msg_start = format!("Running Prettier in {}", project_dir.display());
+    logging::add_log_entry(LogSource::WatcherPrettier, LogLevel::Info, msg_start.clone());
+    tracing::info!(target: "galatea::watcher::prettier", source_process = "prettier_runner", "{}", msg_start);
 
     let mut cmd = Command::new("npm");
     cmd.current_dir(&project_dir)
         .args(&["run", "format"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
-    println!(
-        "Running Prettier via npm script: npm run format in {}",
-        project_dir.display()
-    );
 
     let output = cmd
         .spawn()
@@ -174,23 +179,39 @@ pub async fn run_format() -> Result<Vec<String>> {
     match output.status.success() {
         true => {
             // Log stdout if present
+            let mut log_messages = Vec::new();
             if !stdout_str.is_empty() {
-                println!("'npm run format' stdout: {}", stdout_str);
+                let stdout_log = format!("'npm run format' stdout: {}", stdout_str);
+                logging::add_log_entry(LogSource::WatcherPrettier, LogLevel::Debug, stdout_log.clone());
+                tracing::info!(target: "galatea::watcher::prettier", source_process = "prettier_runner", "{}", stdout_log);
+                log_messages.push(stdout_log);
             }
 
             // Log stderr as warning/info even on success
             if !stderr_str.is_empty() {
-                println!("Warning/Info: 'npm run format' stderr: {}", stderr_str);
+                let stderr_log = format!("'npm run format' stderr (info): {}", stderr_str);
+                logging::add_log_entry(LogSource::WatcherPrettier, LogLevel::Info, stderr_log.clone());
+                tracing::warn!(target: "galatea::watcher::prettier", source_process = "prettier_runner", "{}", stderr_log);
+                log_messages.push(stderr_log);
             }
-
+            let final_msg = if log_messages.is_empty() {
+                "Prettier run completed with no specific output.".to_string()
+            } else {
+                format!("Prettier run completed. Details: {}", log_messages.join("; "))
+            };
+            logging::add_log_entry(LogSource::WatcherPrettier, LogLevel::Info, final_msg);
             Ok(Vec::new())
         }
-        false => Err(anyhow!(
-            "'npm run format' execution failed with status {}. Stdout: '{}'. Stderr: '{}'",
-            output.status,
-            stdout_str,
-            stderr_str
-        )),
+        false => {
+            let err_msg = format!(
+                "'npm run format' execution failed with status {}. Stdout: '{}'. Stderr: '{}'",
+                output.status,
+                stdout_str,
+                stderr_str
+            );
+            logging::add_log_entry(LogSource::WatcherPrettier, LogLevel::Error, err_msg.clone());
+            Err(anyhow!(err_msg))
+        }
     }
 }
 
@@ -207,17 +228,16 @@ impl LspClient {
     pub async fn new() -> Result<Self> {
         let project_dir = resolver::get_project_root()?;
 
+        let msg_spawn = format!("Spawning LSP server (npm run lsp) in {}", project_dir.display());
+        logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, msg_spawn.clone());
+        tracing::info!(target: "galatea::watcher::lsp", source_process = "lsp_server_spawner", "{}", msg_spawn);
+
         let mut cmd = Command::new("npm");
         cmd.current_dir(&project_dir)
             .args(&["run", "lsp"]) // The script "lsp": "typescript-language-server --stdio"
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        println!(
-            "Spawning LSP server via npm script: npm run lsp in {}",
-            project_dir.display()
-        );
 
         let mut child = cmd
             .spawn()
@@ -254,7 +274,9 @@ impl LspClient {
                 loop {
                     if lines_scanned_for_this_message_headers >= MAX_LINES_TO_SCAN_FOR_HEADERS {
                         if content_length.is_none() {
-                            eprintln!("LSP stdout: Scanned {} lines without finding a Content-Length header.", MAX_LINES_TO_SCAN_FOR_HEADERS);
+                            let eof_msg = format!("Scanned {} lines without finding a Content-Length header.", MAX_LINES_TO_SCAN_FOR_HEADERS);
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Warn, eof_msg.clone());
+                            tracing::warn!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", eof_msg);
                         }
                         break;
                     }
@@ -263,19 +285,23 @@ impl LspClient {
                     match reader.read_line(&mut line_buffer).await {
                         Ok(0) => {
                             // EOF
-                            eprintln!("LSP stdout closed (EOF) while reading headers.");
+                            let eof_msg = "LSP stdout closed (EOF) while reading headers.";
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Warn, eof_msg.to_string());
+                            tracing::warn!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", eof_msg);
                             return; // Exit task
                         }
                         Ok(_) => {
                             lines_scanned_for_this_message_headers += 1;
                             let trimmed_line = line_buffer.trim();
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Trace, format!("LSP Server Header Line: {}", trimmed_line));
 
                             if trimmed_line.is_empty() {
                                 if content_length.is_some() {
                                     break; // End of headers if Content-Length was found
                                 } else {
                                     // Empty line before Content-Length, possibly initial noise.
-                                    println!("LSP stdout (skipped initial empty line before Content-Length)");
+                                    logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Debug, "Skipped initial empty line before Content-Length".to_string());
+                                    tracing::debug!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "Skipped initial empty line before Content-Length");
                                     continue; // Continue scanning up to MAX_LINES_TO_SCAN_FOR_HEADERS
                                 }
                             }
@@ -289,14 +315,14 @@ impl LspClient {
                                     headers_map.insert(key.to_string(), value.to_string());
                                 }
                             } else {
-                                println!(
-                                    "LSP stdout (skipped initial non-header line): {}",
-                                    trimmed_line
-                                );
+                                logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Debug, format!("Skipped initial non-header line: {}", trimmed_line));
+                                tracing::debug!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "Skipped initial non-header line: {}", trimmed_line);
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error reading line for LSP headers: {}", e);
+                            let err_msg = format!("Error reading line for LSP headers: {}", e);
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, err_msg.clone());
+                            tracing::error!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", err_msg);
                             return; // Exit task
                         }
                     }
@@ -305,24 +331,29 @@ impl LspClient {
                 if let Some(len) = content_length {
                     let mut buffer = vec![0; len];
                     if reader.read_exact(&mut buffer).await.is_err() {
-                        eprintln!(
-                            "LSP stdout error reading message body or closed (from npm run lsp)."
-                        );
+                        let err_msg = "Error reading message body or stream closed.";
+                        logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, err_msg.to_string());
+                        tracing::error!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", err_msg);
                         return;
                     }
                     let msg_str = String::from_utf8_lossy(&buffer);
+                    logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Debug, format!("LSP Server Message Body: {}", msg_str));
                     match serde_json::from_str::<JsonRpc>(&msg_str) {
                         Ok(rpc_msg) => {
+                            let rpc_log_msg = format!("Parsed LSP RPC message: {:?}", rpc_msg);
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Debug, rpc_log_msg);
+
                             if stdout_tx_clone.send(rpc_msg).await.is_err() {
-                                eprintln!("Failed to send LSP message to internal channel (receiver dropped, from npm run lsp).");
+                                let err_send_msg = "Failed to send LSP message to internal channel (receiver dropped).";
+                                logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_send_msg.to_string());
+                                tracing::error!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", err_send_msg);
                                 return;
                             }
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Failed to parse LSP message (from npm run lsp): {}. Raw: '{}'",
-                                e, msg_str
-                            );
+                            let parse_err_msg = format!("Failed to parse LSP message: {}. Raw: '{}'", e, msg_str);
+                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, parse_err_msg.clone());
+                            tracing::error!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", "{}", parse_err_msg);
                         }
                     }
                 } else {
@@ -334,32 +365,39 @@ impl LspClient {
                         // Avoid logging this if we simply hit MAX_LINES_TO_SCAN_FOR_HEADERS with no useful header info found,
                         // as that case is already logged above. Only log if we broke for other reasons (e.g. early empty line after some junk)
                         // or if we scanned fewer than max lines but still failed.
-                        eprintln!(
-                            "LSP message processing did not yield a Content-Length. Headers map: {:?}, Lines scanned: {}",
-                            headers_map, lines_scanned_for_this_message_headers
-                        );
+                        logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Warn, format!("LSP message processing did not yield a Content-Length. Headers map: {:?}, Lines scanned: {}", headers_map, lines_scanned_for_this_message_headers));
+                        tracing::warn!(target: "galatea::watcher::lsp_stdout_parser", source_process = "lsp_server", 
+                                       "LSP message processing did not yield a Content-Length. Headers map: {:?}, Lines scanned: {}", 
+                                       headers_map, lines_scanned_for_this_message_headers);
                     }
                 }
             } // End of main message reading loop
         });
 
         // Reader task for stderr
+        let stderr_tx_clone = response_tx; // Not strictly needed to clone for this, but good practice
         tokio::spawn(async move {
-            let mut stderr_reader = BufReader::new(stderr);
-            let mut line = String::new();
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = String::new();
             loop {
-                match stderr_reader.read_line(&mut line).await {
+                match reader.read_line(&mut buffer).await {
                     Ok(0) => {
-                        eprintln!("LSP stderr closed (EOF) (from npm run lsp).");
-                        return;
-                    } // EOF
+                        let eof_msg = "LSP Server (stderr): Stream closed.";
+                        logging::add_log_entry(LogSource::WatcherLspServerStderr, LogLevel::Debug, eof_msg.to_string());
+                        tracing::debug!(target: "galatea::watcher::lsp_server_stderr", source_process = "lsp_server", "{}", eof_msg);
+                        break;
+                    }
                     Ok(_) => {
-                        eprint!("LSP stderr (from npm run lsp): {}", line); // Prefix to distinguish
-                        line.clear();
+                        let line_content = buffer.trim_end().to_string();
+                        logging::add_log_entry(LogSource::WatcherLspServerStderr, LogLevel::Warn, line_content.clone());
+                        tracing::warn!(target: "galatea::watcher::lsp_server_stderr", source_process = "lsp_server", "{}", line_content);
+                        buffer.clear(); // Clear buffer for next line
                     }
                     Err(e) => {
-                        eprintln!("Error reading from LSP stderr (from npm run lsp): {}", e);
-                        return;
+                        let err_msg = format!("LSP Server (stderr): Error reading from stream: {}", e);
+                        logging::add_log_entry(LogSource::WatcherLspServerStderr, LogLevel::Error, err_msg.clone());
+                        tracing::error!(target: "galatea::watcher::lsp_server_stderr", source_process = "lsp_server", "{}", err_msg);
+                        break;
                     }
                 }
             }
@@ -381,6 +419,12 @@ impl LspClient {
         let msg_json = serde_json::to_string(&rpc)
             .with_context(|| format!("Failed to serialize LSP RPC: {:?}", rpc))?;
         let msg_with_header = format!("Content-Length: {}\r\n\r\n{}", msg_json.len(), msg_json);
+
+        logging::add_log_entry(
+            LogSource::WatcherLspClientRequest,
+            LogLevel::Debug, 
+            format!("Sending LSP RPC: Method: {:?}, ID: {:?}, Params: {:?}", rpc.get_method(), rpc.get_id(), rpc.get_params())
+        );
 
         self.writer
             .write_all(msg_with_header.as_bytes())
@@ -423,24 +467,34 @@ impl LspClient {
                 Ok(Some(response_candidate)) => {
                     match response_candidate.get_id() {
                         Some(id) if id == request_id.clone() => {
+                            logging::add_log_entry(
+                                LogSource::WatcherLspClientResponse,
+                                LogLevel::Debug, 
+                                format!("Received matching LSP response for ID {:?}: {:?}", request_id, response_candidate)
+                            );
                             return Ok(response_candidate);
                         }
                         Some(other_id) => {
-                            // It has an ID, but it's not the one we're waiting for
+                            let log_level = if response_candidate.get_method().is_some() { LogLevel::Warn } else { LogLevel::Debug };
+                            logging::add_log_entry(
+                                if response_candidate.get_method().is_some() { LogSource::WatcherLspClientNotification } else { LogSource::WatcherLspClientResponse }, 
+                                log_level, 
+                                format!(
+                                    "Received LSP message for different ID ({:?}) while waiting for ID {:?}. Full message: {:?}", 
+                                    other_id, request_id, response_candidate
+                                )
+                            );
                             response_candidate.get_method()
                                 .map_or_else(
                                     || {
-                                        // Likely a response (Success or Error) to a different client-initiated request
-                                        println!(
-                                            "LSP Client: Received response for a different ID ({:?}) while waiting for ID {:?}. Full message: {:?}",
-                                            other_id, request_id, response_candidate
-                                        );
+                                        tracing::debug!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", 
+                                                      "Received response for a different ID ({:?}) while waiting for ID {:?}. Full message: {:?}", 
+                                                      other_id, request_id, response_candidate);
                                     },
                                     |method| {
-                                        println!(
-                                            "LSP Client: Received a SERVER REQUEST (Method: {}, ID: {:?}) while waiting for response to ID {:?}. This is unexpected while polling for a specific response.",
-                                            method, other_id, request_id
-                                        );
+                                        tracing::warn!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", 
+                                                     "Received a SERVER REQUEST (Method: {}, ID: {:?}) while waiting for response to ID {:?}. This is unexpected while polling for a specific response.", 
+                                                     method, other_id, request_id);
                                     }
                                 );
                         }
@@ -450,7 +504,7 @@ impl LspClient {
                                 .get_method()
                                 .unwrap_or("[unknown_method]");
                             
-                            // Get detailed params representation
+                            // Define params_detail here before it's used
                             let params_detail = response_candidate.get_params().map_or(
                                 "[no_params]".to_string(),
                                 |params| match params {
@@ -472,24 +526,36 @@ impl LspClient {
                                 },
                             );
 
-                            println!(
-                                "LSP Client: Received notification (Method: {}) while waiting for response to ID {:?}.\nParams: {}",
-                                method_name, request_id, params_detail
+                            logging::add_log_entry(
+                                LogSource::WatcherLspClientNotification, // Server-initiated notification
+                                LogLevel::Debug,
+                                format!(
+                                    "Received LSP notification (Method: {}) while waiting for response to ID {:?}. Params: {}", 
+                                    method_name, request_id, params_detail // Now params_detail is in scope
+                                )
                             );
+
+                            tracing::debug!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", 
+                                          "Received notification (Method: {}) while waiting for response to ID {:?}. Params: {}", 
+                                          method_name, request_id, params_detail);
                         }
                     }
                 }
                 Ok(None) => {
-                    return Err(anyhow!(
+                    let err_msg = format!(
                         "LSP response channel closed while waiting for request ID {:?}",
                         request_id
-                    ))
+                    );
+                    logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
+                    return Err(anyhow!(err_msg))
                 }
                 Err(_) => {
-                    return Err(anyhow!(
+                    let timeout_msg = format!(
                         "Timeout waiting for LSP response for request ID {:?}",
                         request_id
-                    ))
+                    );
+                    logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, timeout_msg.clone());
+                    return Err(anyhow!(timeout_msg))
                 } // Elapsed
             }
         }
@@ -516,16 +582,17 @@ impl LspClient {
 
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_uri: None, // Explicitly not sending the deprecated rootUri field in the request
-            root_path: None, // Deprecated in favor of root_uri and workspace_folders
+            root_uri: None, 
+            root_path: None, 
             initialization_options: None,
             capabilities: client_capabilities,
             trace: None,
-            workspace_folders: Some(vec![workspace_folder]), // Populate workspace_folders
+            workspace_folders: Some(vec![workspace_folder]), 
             client_info: None,
-            locale: None, // Kept as None, should be valid Option<String>
+            locale: None, 
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
+        logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "Sending LSP Initialize request".to_string());
         let request_id = self
             .send_request(
                 lsp_types::request::Initialize::METHOD,
@@ -542,6 +609,7 @@ impl LspClient {
             .await
             .context("Waiting for Initialize response from LSP failed")?;
 
+        logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, format!("Received LSP Initialize response: {:?}", response_rpc.get_result().is_some()));
         // Use get_result() on JsonRpc enum directly
         match response_rpc.get_result() {
             Some(result_value) => {
@@ -569,12 +637,17 @@ impl LspClient {
     ) -> Result<()> {
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri,
+                uri: uri.clone(), // Clone for logging
                 language_id: language_id.to_string(),
                 version,
                 text,
             },
         };
+        logging::add_log_entry(
+            LogSource::WatcherLspClientNotification, // This is client sending a notification
+            LogLevel::Info, 
+            format!("Sending LSP DidOpenTextDocument notification for {:?}: lang={}, ver={}", uri, language_id, version)
+        );
         self.send_notification(
             lsp_types::notification::DidOpenTextDocument::METHOD,
             Params::from(serde_json::to_value(params).context("Serialize DidOpenParams error")?),
@@ -589,12 +662,17 @@ impl LspClient {
     ) -> Result<Option<lsp_types::GotoDefinitionResponse>> {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
+        logging::add_log_entry(
+            LogSource::WatcherLspClientRequest,
+            LogLevel::Info, 
+            format!("Sending LSP GotoDefinition request for {:?}:({},{})", uri, position.line, position.character)
+        );
         let request_id = self
             .send_request(
                 lsp_types::request::GotoDefinition::METHOD,
@@ -611,6 +689,11 @@ impl LspClient {
             .await
             .context("Waiting for GotoDefinition response from LSP failed")?;
 
+        logging::add_log_entry(
+            LogSource::WatcherLspClientResponse, 
+            LogLevel::Info, 
+            format!("Received LSP GotoDefinition response. Has result: {}", response_rpc.get_result().is_some())
+        );
         // Use get_result() on JsonRpc enum directly
         match response_rpc.get_result() {
             Some(result_value) => serde_json::from_value(result_value.clone()) // Option<GotoDefinitionResponse> handles null/array
@@ -628,29 +711,52 @@ impl LspClient {
     pub async fn close(mut self) -> Result<()> {
         // Try to send shutdown request
         let shutdown_params = Params::None(());
+        logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "Attempting to send LSP Shutdown request".to_string());
         match self
             .send_request(lsp_types::request::Shutdown::METHOD, shutdown_params)
             .await
         {
             Ok(shutdown_id) => match self.wait_for_response(&shutdown_id, 5).await {
-                Ok(_) => println!("LSP Shutdown successful."),
-                Err(e) => eprintln!("LSP Shutdown request failed or timed out: {}", e),
+                Ok(_) => {
+                    logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "LSP Shutdown successful.".to_string());
+                    tracing::info!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", "LSP Shutdown successful.");
+                }
+                Err(e) => {
+                    let err_msg = format!("LSP Shutdown request failed or timed out: {}", e);
+                    logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
+                    tracing::error!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", "{}", err_msg);
+                }
             },
-            Err(e) => eprintln!("Failed to send LSP Shutdown request: {}", e),
+            Err(e) => {
+                let err_msg = format!("Failed to send LSP Shutdown request: {}", e);
+                logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
+                tracing::error!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", "{}", err_msg);
+            }
         }
 
         // Send exit notification (fire and forget)
+        logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "Sending LSP Exit notification".to_string());
         if let Err(e) = self
             .send_notification(lsp_types::notification::Exit::METHOD, Params::None(()))
             .await
         {
-            eprintln!("Failed to send LSP Exit notification: {}", e);
+            let err_msg = format!("Failed to send LSP Exit notification: {}", e);
+            logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
+            tracing::error!(target: "galatea::watcher::lsp_client_logic", source_component = "lsp_client", "{}", err_msg);
         }
 
         // Wait for the child process to exit
         match self.child_process.wait().await {
-            Ok(status) => println!("LSP child process exited with status: {}", status),
-            Err(e) => eprintln!("Failed to wait for LSP child process exit: {}", e),
+            Ok(status) => {
+                let exit_msg = format!("LSP child process exited with status: {}", status);
+                logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, exit_msg.clone());
+                tracing::info!(target: "galatea::watcher::lsp_client_logic", source_process = "lsp_server", "{}", exit_msg);
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to wait for LSP child process exit: {}", e);
+                logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Error, err_msg.clone());
+                tracing::error!(target: "galatea::watcher::lsp_client_logic", source_process = "lsp_server", "{}", err_msg);
+            }
         }
         Ok(())
     }

@@ -9,3 +9,5 @@ pub mod wanderer;
 pub mod watcher;
 pub mod resolver;
 pub mod debugger;
+pub mod utils;
+pub mod logging;

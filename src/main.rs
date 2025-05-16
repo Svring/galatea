@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
 
 // Use modules
-use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver, debugger};
+use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver, debugger, utils, logging};
 
 // Add Poem imports
 use poem::{
@@ -174,6 +175,26 @@ struct GotoDefinitionApiResponse {
 
 // package.json API Response - uses watcher::PackageJsonData directly
 
+// Log API Request/Response types
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct GetLogsRequest {
+    #[serde(flatten)]
+    filter_options: logging::LogFilterOptions,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GetLogsResponse {
+    success: bool,
+    logs: Vec<logging::LogEntry>,
+    count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClearLogsResponse {
+    success: bool,
+    message: String,
+}
+
 #[handler]
 async fn health() -> &'static str {
     "Galatea API is running"
@@ -318,10 +339,8 @@ async fn parse_directory(
 async fn query_collection(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    println!(
-        "API query request for collection '{}': {}",
-        req.collection_name, req.query_text
-    );
+    info!(target: "galatea::api", collection_name = %req.collection_name, query_text = %req.query_text, "API query request");
+
     let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
 
     match hoarder::query(
@@ -336,7 +355,7 @@ async fn query_collection(
     {
         Ok(entities) => Ok(Json(entities)),
         Err(e) => {
-            eprintln!("Error in API query_collection: {}", e);
+            error!(target: "galatea::api", error = ?e, collection_name = %req.collection_name, "Error in API query_collection");
             Err(poem::Error::from_string(
                 format!("Error querying collection: {}", e),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -349,10 +368,8 @@ async fn query_collection(
 async fn generate_embeddings_api(
     Json(req): Json<GenerateEmbeddingsRequest>,
 ) -> Result<Json<GenericApiResponse>, poem::Error> {
-    println!(
-        "API request to generate embeddings: input='{}', output='{}'",
-        req.input_file, req.output_file
-    );
+    info!(target: "galatea::api", input_file = %req.input_file, output_file = %req.output_file, "API request to generate embeddings");
+
     let input_path = std::path::PathBuf::from(&req.input_file);
     let output_path = std::path::PathBuf::from(&req.output_file);
 
@@ -378,7 +395,7 @@ async fn generate_embeddings_api(
             details: Some(format!("Output written to {}", req.output_file)),
         })),
         Err(e) => {
-            eprintln!("Error in API generate_embeddings_api: {}", e);
+            error!(target: "galatea::api", error = ?e, input_file = %req.input_file, "Error in API generate_embeddings_api");
             Err(poem::Error::from_string(
                 format!("Failed to generate embeddings: {}", e),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -391,10 +408,8 @@ async fn generate_embeddings_api(
 async fn upsert_embeddings_api(
     Json(req): Json<UpsertEmbeddingsRequest>,
 ) -> Result<Json<GenericApiResponse>, poem::Error> {
-    println!(
-        "API request to upsert embeddings: input='{}', collection='{}'", 
-        req.input_file, req.collection_name
-    );
+    info!(target: "galatea::api", input_file = %req.input_file, collection_name = %req.collection_name, "API request to upsert embeddings");
+
     let input_path = std::path::PathBuf::from(&req.input_file);
     let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
 
@@ -407,10 +422,7 @@ async fn upsert_embeddings_api(
 
     // Ensure collection exists (optional, create_collection is idempotent)
     if let Err(e) = hoarder::create_collection(&req.collection_name, qdrant_url).await {
-        eprintln!(
-            "Error creating collection '{}' (it might already exist or Qdrant is down): {}",
-            req.collection_name, e
-        );
+        warn!(target: "galatea::api", error = ?e, collection_name = %req.collection_name, "Error creating collection (it might already exist or Qdrant is down)");
         // Decide if this is a hard error or if we can proceed assuming it might exist.
         // For now, let's proceed, as upsert will fail if collection doesn't exist and couldn't be created.
     }
@@ -425,7 +437,7 @@ async fn upsert_embeddings_api(
             )),
         })),
         Err(e) => {
-            eprintln!("Error in API upsert_embeddings_api: {}", e);
+            error!(target: "galatea::api", error = ?e, input_file = %req.input_file, collection_name = %req.collection_name, "Error in API upsert_embeddings_api");
             Err(poem::Error::from_string(
                 format!("Failed to upsert embeddings: {}", e),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -438,10 +450,8 @@ async fn upsert_embeddings_api(
 async fn build_index_api(
     Json(req): Json<BuildIndexRequest>,
 ) -> Result<Json<GenericApiResponse>, poem::Error> {
-    println!(
-        "API request to build index: dir='{}', collection='{}'",
-        req.dir, req.collection_name
-    );
+    info!(target: "galatea::api::build_index", directory = %req.dir, collection_name = %req.collection_name, "API request to build index (background task)");
+
     let qdrant_url_for_spawn = req
         .qdrant_url
         .clone()
@@ -485,24 +495,24 @@ async fn build_index_api(
             _ => processing::Granularity::Fine, // Default to fine
         };
 
-        println!("--- Starting Full Index Build (API Triggered) ---");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Starting Full Index Build (API Triggered)");
 
-        println!("[1/4] Finding files...");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[1/4] Finding files...");
         let files_to_parse =
             match wanderer::find_files_by_extensions(&dir_path, &suffixes_ref, &exclude_dirs_ref) {
             Ok(files) => files,
             Err(e) => {
-                eprintln!("BuildIndex API: Wander step failed: {}", e);
+                error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Wander step failed");
                 return;
             }
         };
         if files_to_parse.is_empty() { 
-            println!("BuildIndex API: No matching files found. Index build cancelled."); 
+            info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "No matching files found. Index build cancelled.");
             return; 
         }
-        println!("BuildIndex API: Found {} files.", files_to_parse.len());
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = files_to_parse.len(), "Found files.");
 
-        println!("[2/4] Parsing files...");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[2/4] Parsing files...");
         let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
         for file_path in files_to_parse {
             let extension = file_path.extension().and_then(|ext| ext.to_str());
@@ -522,34 +532,23 @@ async fn build_index_api(
             };
             match parse_result {
                 Ok(entities) => all_entities.extend(entities),
-                Err(e) => eprintln!(
-                    "BuildIndex API: Error parsing {}: {}. Skipping.",
-                    file_path.display(),
-                    e
-                ),
+                Err(e) => {
+                    error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, file_path = %file_path.display(), "Error parsing file. Skipping.");
+                }
             }
         }
-        println!(
-            "BuildIndex API: Parsed {} initial entities.",
-            all_entities.len()
-        );
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = all_entities.len(), "Parsed initial entities.");
 
-        println!(
-            "[2b/4] Post-processing entities (granularity: {:?})...",
-            granularity
-        );
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", ?granularity, "[2b/4] Post-processing entities...");
         let processed_entities =
             processing::post_process_entities(all_entities, granularity, max_snippet_size_clone);
-        println!(
-            "BuildIndex API: {} entities after post-processing.",
-            processed_entities.len()
-        );
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = processed_entities.len(), "Entities after post-processing.");
         if processed_entities.is_empty() { 
-            println!("BuildIndex API: No entities after processing. Index build cancelled."); 
+            info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "No entities after processing. Index build cancelled.");
             return; 
         }
 
-        println!("[3/4] Generating embeddings...");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[3/4] Generating embeddings...");
         let entities_with_embeddings = match embedder::generate_embeddings_for_vec(
             processed_entities,
             embedding_model_clone, // Use cloned data
@@ -560,29 +559,23 @@ async fn build_index_api(
         {
             Ok(entities) => entities,
             Err(e) => {
-                eprintln!("BuildIndex API: Embedding step failed: {}", e);
+                error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Embedding step failed");
                 return;
             }
         };
-        println!("BuildIndex API: Embeddings generated.");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Embeddings generated.");
         if entities_with_embeddings
             .iter()
             .all(|e| e.embedding.is_none())
         {
-            println!("BuildIndex API: Warning: No entities had embeddings generated successfully.");
+            warn!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Warning: No entities had embeddings generated successfully.");
         }
 
-        println!(
-            "[4/4] Storing embeddings in Qdrant collection '{}'...",
-            collection_name_clone
-        ); // Use cloned data
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", collection_name = %collection_name_clone, "[4/4] Storing embeddings in Qdrant collection...");
         if let Err(e) = hoarder::create_collection(&collection_name_clone, &qdrant_url_inner).await
         {
             // Use cloned data
-            eprintln!(
-                "BuildIndex API: Failed to ensure Qdrant collection exists: {}",
-                e
-            );
+            error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, collection_name = %collection_name_clone, "Failed to ensure Qdrant collection exists");
             return;
         }
         if let Err(e) = hoarder::upsert_entities_from_vec(
@@ -593,14 +586,11 @@ async fn build_index_api(
         .await
         {
             // Use cloned data
-            eprintln!(
-                "BuildIndex API: Upserting embeddings to Qdrant failed: {}",
-                e
-            );
+            error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Upserting embeddings to Qdrant failed");
             return;
         }
 
-        println!("--- Index Build Complete (API Triggered) ---");
+        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "--- Index Build Complete (API Triggered) ---");
     });
 
     Ok(Json(GenericApiResponse {
@@ -872,16 +862,54 @@ async fn lsp_goto_definition_api(
     }
 }
 
+// --- Log Handlers ---
+#[handler]
+async fn get_logs_api(
+    Json(req): Json<GetLogsRequest>,
+) -> Result<Json<GetLogsResponse>, poem::Error> {
+    info!(target: "galatea::api::logs", filter_options = ?req.filter_options, "API request to get logs");
+    match logging::get_shared_logs(req.filter_options) {
+        Ok(logs) => Ok(Json(GetLogsResponse {
+            success: true,
+            count: logs.len(),
+            logs,
+        })),
+        Err(e) => {
+            error!(target: "galatea::api::logs", error = ?e, "Error fetching logs");
+            Err(poem::Error::from_string(
+                format!("Failed to get logs: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+
+#[handler]
+async fn clear_logs_api() -> Result<Json<ClearLogsResponse>, poem::Error> {
+    info!(target: "galatea::api::logs", "API request to clear logs");
+    match logging::clear_shared_logs() {
+        Ok(_) => Ok(Json(ClearLogsResponse {
+            success: true,
+            message: "Logs cleared successfully.".to_string(),
+        })),
+        Err(e) => {
+            error!(target: "galatea::api::logs", error = ?e, "Error clearing logs");
+            Err(poem::Error::from_string(
+                format!("Failed to clear logs: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+// --- End Log Handlers ---
+
 async fn start_server(host: &str, port: u16) -> Result<()> {
     let editor_state = Arc::new(Mutex::new(editor::Editor::new()));
 
     let lsp_client = match watcher::LspClient::new().await {
         Ok(client) => client,
         Err(e) => {
-            eprintln!(
-                "Failed to initialize LSP client: {}. LSP features will be unavailable.",
-                e
-            );
+            error!(target: "galatea::main", source_component = "lsp_client_setup", error = ?e, "Failed to initialize LSP client. LSP features will be unavailable.");
             panic!("LSP Client initialization failed: {}", e);
         }
     };
@@ -901,10 +929,7 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
         .initialize(root_uri.clone(), client_capabilities.clone())
         .await
     {
-        eprintln!(
-            "LSP server initialization failed: {}. GotoDefinition might not work.",
-            e
-        );
+        warn!(target: "galatea::main", source_component = "lsp_client_setup", error = ?e, "LSP server initialization failed. GotoDefinition might not work.");
     }
 
     let lsp_client_state = Arc::new(Mutex::new(lsp_client_instance));
@@ -922,6 +947,8 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
         .at("/lint", post(lint_api))
         .at("/format-write", post(format_api))
         .at("/lsp/goto-definition", post(lsp_goto_definition_api))
+        .at("/logs/get", post(get_logs_api))
+        .at("/logs/clear", post(clear_logs_api))
         .with(
             Cors::new()
             .allow_credentials(true)
@@ -938,8 +965,8 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
         // Serve static files directly from the root path
         .nest("/", static_files);
 
-    println!("Starting Galatea server on {}:{}", host, port);
-    println!("Serving API at /api and static files from ./dist at / ");
+    info!(target: "galatea::main", source_component = "server_startup", host, port, "Starting Galatea server");
+    info!(target: "galatea::main", source_component = "server_startup", "Serving API at /api and static files from ./dist at / ");
     Server::new(TcpListener::bind(format!("{}:{}", host, port)))
         .run(app.data(editor_state).data(lsp_client_state)) // Add lsp_client_state
         .await
@@ -950,18 +977,39 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     
+    // Ensure Galatea server port (3051) is free before any other setup
+    if let Err(e) = utils::ensure_port_is_free(3051, "Galatea main server").await {
+        error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to ensure port 3051 is free for Galatea server. Server will not start.");
+        return Err(e.context("Failed to free port 3051 for Galatea server"));
+    }
+    
     // Verify and set up the project environment using the debugger module
     if let Err(e) = debugger::verify_and_setup_project().await {
-        eprintln!("Failed to verify and set up the project environment: {:?}", e);
-        eprintln!("Please check the errors above. Server will not start.");
+        error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to verify and set up project environment. Server will not start.");
         return Err(e); 
     }
-    println!("Project environment verified and set up successfully.");
+    info!(target: "galatea::main", source_component = "bootstrap", "Project environment verified and set up successfully.");
+
+    // Start the Next.js dev server in the background
+    tokio::spawn(async move {
+        match resolver::get_project_root() {
+            Ok(project_root) => {
+                info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Attempting to start the Next.js development server...");
+                if let Err(e) = debugger::start_dev_server(&project_root).await {
+                    error!(target: "galatea::main", source_component = "next_dev_server_supervisor", error = ?e, "Failed to start or monitor the Next.js development server.");
+                } else {
+                    info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Next.js development server process has finished.");
+                }
+            }
+            Err(e) => {
+                error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to get project root for starting dev server. Dev server will not start.");
+            }
+        }
+    });
     
     // Default server settings
     let host = "0.0.0.0";
     let port = 3051;
     
-    println!("Starting server with default settings on {}:{}...", host, port);
     start_server(host, port).await
 }

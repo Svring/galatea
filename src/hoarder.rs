@@ -13,6 +13,7 @@ use serde_json::json; // Import json macro
 use std::convert::TryFrom; // Needed for Payload::try_from
 use std::fs;
 use std::path::Path;
+use tracing::{debug, error, info, warn}; // Added tracing import
 use uuid::Uuid;
 
 // Define dimension for OpenAI text-embedding-3-small
@@ -24,11 +25,11 @@ pub async fn create_collection(collection_name: &str, qdrant_url: &str) -> Resul
 
     // Check if collection already exists (optional, but good practice)
     if client.collection_exists(collection_name).await? {
-        println!("Collection '{}' already exists.", collection_name);
+        info!(target: "galatea::hoarder", collection_name = %collection_name, "Collection already exists.");
         return Ok(());
     }
 
-    println!("Creating collection: {}", collection_name);
+    info!(target: "galatea::hoarder", collection_name = %collection_name, "Creating collection.");
     // Explicitly create VectorParams first
     let vector_params = VectorParamsBuilder::new(EMBEDDING_DIMENSION, Distance::Cosine).build();
     // Then create VectorsConfig using these params
@@ -52,7 +53,7 @@ async fn upsert_entities_core(
     client: &Qdrant, // Accept client reference
 ) -> Result<()> {
     let mut points_to_upsert = Vec::new();
-    println!("Preparing {} entities for upsert...", entities.len());
+    info!(target: "galatea::hoarder", count = entities.len(), "Preparing entities for upsert.");
 
     for entity in entities {
         if let Some(vector) = entity.embedding {
@@ -69,40 +70,30 @@ async fn upsert_entities_core(
             let payload = match Payload::try_from(payload_value) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to convert entity '{}' to payload: {}. Skipping.",
-                        entity.name, e
-                    );
+                    warn!(target: "galatea::hoarder", entity_name = %entity.name, error = ?e, "Failed to convert entity to payload. Skipping.");
                     continue;
                 }
             };
             let point_id = Uuid::new_v4().to_string();
             points_to_upsert.push(PointStruct::new(point_id, vector, payload));
         } else {
-            println!(
-                "Skipping entity '{}' due to missing embedding.",
-                entity.name
-            );
+            debug!(target: "galatea::hoarder", entity_name = %entity.name, "Skipping entity due to missing embedding.");
         }
     }
 
     if points_to_upsert.is_empty() {
-        println!("No valid points with embeddings found to upsert.");
+        info!(target: "galatea::hoarder", "No valid points with embeddings found to upsert.");
         return Ok(());
     }
 
-    println!(
-        "Upserting {} points into collection '{}'...",
-        points_to_upsert.len(),
-        collection_name
-    );
+    info!(target: "galatea::hoarder", count = points_to_upsert.len(), collection_name = %collection_name, "Upserting points into collection.");
     let response =
         client // Use passed client reference
             .upsert_points(UpsertPointsBuilder::new(collection_name, points_to_upsert))
             .await?;
 
-    println!("Upsert finished.");
-    dbg!(response);
+    info!(target: "galatea::hoarder", "Upsert finished.");
+    debug!(target: "galatea::hoarder", ?response, "Upsert response details.");
     Ok(())
 }
 
@@ -113,7 +104,7 @@ pub async fn upsert_embeddings(
     qdrant_url: &str,
 ) -> Result<()> {
     let client = Qdrant::from_url(qdrant_url).build()?;
-    println!("Reading embeddings from: {}", json_file_path.display());
+    info!(target: "galatea::hoarder", path = %json_file_path.display(), "Reading embeddings from file.");
     let json_content = fs::read_to_string(json_file_path)
         .with_context(|| format!("Failed to read file: {}", json_file_path.display()))?;
     let entities: Vec<CodeEntity> = serde_json::from_str(&json_content)
@@ -160,10 +151,7 @@ pub async fn query(
     let model = model_name.unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
     // --- End OpenAI Client Setup ---
 
-    println!(
-        "Generating embedding for query: \"{}\" using model: {}",
-        query, model
-    );
+    info!(target: "galatea::hoarder", query = %query, model_name = %model, "Generating embedding for query.");
 
     // --- Create Embedding Request ---
     let request = CreateEmbeddingRequestArgs::default()
@@ -185,14 +173,11 @@ pub async fn query(
         .next()
         .map(|d| d.embedding)
         .context("No embedding data received from OpenAI API")?;
-    println!("Query embedding generated successfully.");
+    info!(target: "galatea::hoarder", "Query embedding generated successfully.");
     // --- End Embedding Generation ---
 
     // --- Qdrant Client and Search ---
-    println!(
-        "Connecting to Qdrant and searching collection '{}'...",
-        collection_name
-    );
+    info!(target: "galatea::hoarder", collection_name = %collection_name, "Connecting to Qdrant and searching collection.");
     let client = Qdrant::from_url(qdrant_url).build()?;
 
     let search_request = SearchPointsBuilder::new(collection_name, query_embedding, 10) // Limit to 10 results for API
@@ -207,13 +192,9 @@ pub async fn query(
 
     let mut entities: Vec<CodeEntity> = Vec::new();
     if response.result.is_empty() {
-        println!("No results found for query: '{}'", query);
+        info!(target: "galatea::hoarder", query = %query, "No results found for query.");
     } else {
-        println!(
-            "Found {} results for query: '{}'",
-            response.result.len(),
-            query
-        );
+        info!(target: "galatea::hoarder", count = response.result.len(), query = %query, "Found results for query.");
         for point in response.result {
             // Convert payload to JSON value using serde_json
             match serde_json::to_value(&point.payload) {
@@ -228,18 +209,12 @@ pub async fn query(
                             entities.push(entity);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Failed to deserialize payload to CodeEntity: {}. Payload: {}",
-                                e, json_value
-                            );
+                            error!(target: "galatea::hoarder", error = ?e, payload = %json_value, "Failed to deserialize payload to CodeEntity.");
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Failed to convert Qdrant payload to JSON value: {}. Payload: {:?}",
-                        e, point.payload
-                    );
+                    error!(target: "galatea::hoarder", error = ?e, payload = ?point.payload, "Failed to convert Qdrant payload to JSON value.");
                 }
             }
         }
