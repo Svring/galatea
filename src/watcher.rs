@@ -375,7 +375,7 @@ impl LspClient {
         });
 
         // Reader task for stderr
-        let stderr_tx_clone = response_tx; // Not strictly needed to clone for this, but good practice
+        // let stderr_tx_clone = response_tx; // Not strictly needed to clone for this, but good practice
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buffer = String::new();

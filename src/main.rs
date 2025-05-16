@@ -1,4 +1,4 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -668,7 +668,7 @@ async fn editor_command_api(
                 success: true,
                 message: Some(format!("Command '{}' executed successfully.", req.command)),
                 content: Some(content.clone()),
-                file_path: Some(req.path.clone()),
+                file_path: Some(resolved_req_path.to_string_lossy().into_owned()),
                 operation: Some(req.command.clone()),
                 line_count: Some(content.lines().count()),
                 modified_at: Some(timestamp),
@@ -681,7 +681,7 @@ async fn editor_command_api(
                 success: true,
                 message: Some(format!("Command '{}' executed successfully.", req.command)),
                 content: None,
-                file_path: Some(req.path.clone()),
+                file_path: Some(resolved_req_path.to_string_lossy().into_owned()),
                 operation: Some(req.command.clone()),
                 modified_at: Some(timestamp),
                 line_count: Some(0), // Default to 0 lines until we get actual content
@@ -945,7 +945,7 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
         .at("/build-index", post(build_index_api))
         .at("/editor", post(editor_command_api))
         .at("/lint", post(lint_api))
-        .at("/format-write", post(format_api))
+        .at("/format", post(format_api))
         .at("/lsp/goto-definition", post(lsp_goto_definition_api))
         .at("/logs/get", post(get_logs_api))
         .at("/logs/clear", post(clear_logs_api))

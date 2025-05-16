@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
