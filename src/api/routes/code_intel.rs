@@ -1,11 +1,10 @@
-use poem::{Route, get, handler, post, web::Json, http::StatusCode, Error as PoemError, web::Data};
-use anyhow::{Result, Context};
+use poem::{Route, get, handler, post, web::Json, http::StatusCode, Error as PoemError};
+use anyhow::Result;
 use crate::api::models::*;
 use crate::codebase_indexing::parser::{self, CodeEntity};
 use crate::codebase_indexing::postprocessor;
 use crate::codebase_indexing::embedding as embedder;
 use crate::codebase_indexing::vector_db as hoarder;
-use crate::codebase_indexing::pipeline;
 use crate::file_system;
 use tracing::{error, info, warn};
 use tokio;

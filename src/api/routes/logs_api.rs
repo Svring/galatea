@@ -1,6 +1,6 @@
 use poem::{Route, get, handler, post, web::Json, http::StatusCode, Error as PoemError};
 use crate::api::models::{GetLogsRequest, GetLogsResponse, ClearLogsResponse};
-use crate::dev_runtime::logging::{get_shared_logs, clear_shared_logs, LogFilterOptions};
+use crate::dev_runtime::log::{get_shared_logs, clear_shared_logs, LogFilterOptions};
 
 #[poem::handler]
 async fn logs_api_health() -> &'static str {

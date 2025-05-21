@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::dev_runtime::logging as galatea_logging; // Alias to avoid conflict if we have a local logging
-use crate::codebase_indexing::parser::CodeEntity; // Updated path
+use crate::dev_runtime::log as galatea_logging; // Alias to avoid conflict if we have a local logging
 use lsp_types;
 
 // Keep existing structs from main.rs for now, will move them here.

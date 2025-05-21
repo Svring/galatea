@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{error, info, warn}; // For return type of initialize_environment
 use clap::Parser; // Added for command-line argument parsing
 use std::env; // Added for std::env::current_dir
-use std::time::Instant; // Added for timing
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn}; // For return type of initialize_environment // Added for timing
 
 // Use modules
 use galatea::api; // New api module
@@ -43,7 +43,7 @@ async fn initialize_environment(api_key: Option<String>) -> Result<PathBuf> {
     let _enter = span.enter();
 
     tracing::info!(target: "galatea::bootstrap", "Attempting to determine project root...");
-    
+
     let project_dir_path = match file_system::get_project_root() {
         Ok(dir) => {
             tracing::info!(target: "galatea::bootstrap", path = %dir.display(), "Project root found.");
@@ -56,8 +56,9 @@ async fn initialize_environment(api_key: Option<String>) -> Result<PathBuf> {
                 "Failed to get project root. Will attempt to initialize in default location './project'."
             );
             // Define a default project directory if get_project_root fails
-            let current_dir = env::current_dir()
-                .context("Failed to get current working directory to create default project path.")?;
+            let current_dir = env::current_dir().context(
+                "Failed to get current working directory to create default project path.",
+            )?;
             current_dir.join("project")
         }
     };
@@ -77,7 +78,7 @@ async fn launch_nextjs_dev_server_task(project_directory: PathBuf) {
     let span = tracing::info_span!(target: "galatea::main", "nextjs_dev_server_supervisor");
     let _enter = span.enter();
     info!(target: "galatea::main", source_component = "next_dev_server_supervisor", path = %project_directory.display(), "Attempting to start the Next.js development server...");
-    if let Err(e) = dev_runtime::nextjs::start_dev_server(&project_directory).await {
+    if let Err(e) = dev_runtime::nextjs_dev_server::launch_dev_server(&project_directory).await {
         error!(target: "galatea::main", source_component = "next_dev_server_supervisor", error = ?e, "Failed to start or monitor the Next.js development server.");
     } else {
         info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Next.js development server process has finished.");
@@ -160,7 +161,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse(); // Parse command-line arguments
 
     info!(target: "galatea::main", "Phase 1: Initializing environment...");
-    
+
     let now = Instant::now(); // Start timer
     let initialize_result = initialize_environment(cli.api_key).await;
     let elapsed = now.elapsed();
@@ -176,7 +177,7 @@ async fn main() -> Result<()> {
         }
     };
     // The following log is a bit redundant if success is logged above with duration, but kept for consistency if initialize_result itself was not logged.
-    // info!(target: "galatea::main", "Phase 1: Environment initialized successfully."); 
+    // info!(target: "galatea::main", "Phase 1: Environment initialized successfully.");
 
     info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)...");
     // Call the new function within tokio::spawn

@@ -17,7 +17,7 @@ use tracing;
 use jsonrpc_lite::{Id, JsonRpc, Params}; // Ensure this is the only JsonRpc import
 
 use crate::file_system;
-use crate::dev_runtime::logging::{self, LogLevel, LogSource};
+use crate::dev_runtime::log::{self, LogLevel, LogSource};
 
 // --- Language Server (typescript-language-server) Interaction ---
 
@@ -41,7 +41,7 @@ impl LspClient {
             "Spawning LSP server (npm run lsp) in {}",
             project_dir.display()
         );
-        logging::add_log_entry(
+        log::add_log_entry(
             LogSource::WatcherLspServerLifecycle, // TODO: Change to a new LogSource like LspRuntimeLifecycle
             LogLevel::Info,
             msg_spawn.clone(),
@@ -90,7 +90,7 @@ impl LspClient {
                 loop {
                     match reader.read_line(&mut buffer).await {
                         Ok(0) => { // EOF
-                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Warn, "LSP stdout EOF reached while reading headers.".to_string());
+                            log::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Warn, "LSP stdout EOF reached while reading headers.".to_string());
                             tracing::warn!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "LSP stdout EOF reached while reading headers.");
                             return;
                         }
@@ -109,7 +109,7 @@ impl LspClient {
                             buffer.clear();
                         }
                         Err(e) => {
-                            logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, format!("Error reading LSP stdout headers: {}", e));
+                            log::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, format!("Error reading LSP stdout headers: {}", e));
                             tracing::error!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "Error reading LSP stdout headers: {}", e);
                             return;
                         }
@@ -119,7 +119,7 @@ impl LspClient {
                 if let Some(len) = content_length {
                     let mut body_buffer = vec![0; len];
                     if let Err(e) = reader.read_exact(&mut body_buffer).await {
-                        logging::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, format!("Error reading LSP content (length {}): {}", len, e));
+                        log::add_log_entry(LogSource::WatcherLspServerStdout, LogLevel::Error, format!("Error reading LSP content (length {}): {}", len, e));
                         tracing::error!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "Error reading LSP content (length {}): {}", len, e);
                         continue; // Try to recover by reading next message
                     }
@@ -129,24 +129,24 @@ impl LspClient {
                             match serde_json::from_str::<JsonRpc>(json_str) { // Use serde_json::from_str
                                 Ok(rpc) => {
                                     if response_tx.send(rpc).await.is_err() {
-                                        logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, "Failed to send parsed LSP RPC to internal channel (receiver dropped).".to_string());
+                                        log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, "Failed to send parsed LSP RPC to internal channel (receiver dropped).".to_string());
                                         tracing::error!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "Failed to send parsed LSP RPC to internal channel (receiver dropped).");
                                         return; // Channel closed, stop task
                                     }
                                 }
                                 Err(e) => {
-                                    logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, format!("Error parsing LSP JSON-RPC (Content-Length: {}): {}. Content: '{}'", len, e, json_str));
+                                    log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, format!("Error parsing LSP JSON-RPC (Content-Length: {}): {}. Content: '{}'", len, e, json_str));
                                     tracing::error!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "Error parsing LSP JSON-RPC (Content-Length: {}): {}. Content: '{}'", len, e, json_str);
                                 }
                             }
                         }
                         Err(e) => {
-                            logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, format!("LSP message body (Content-Length: {}) was not valid UTF-8: {}", len, e));
+                            log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, format!("LSP message body (Content-Length: {}) was not valid UTF-8: {}", len, e));
                             tracing::error!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "LSP message body (Content-Length: {}) was not valid UTF-8: {}", len, e);
                         }
                     }
                 } else {
-                    logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Warn, "LSP message received without Content-Length header.".to_string());
+                    log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Warn, "LSP message received without Content-Length header.".to_string());
                     tracing::warn!(target: "galatea::dev_runtime::lsp_client::stdout_reader", "LSP message without Content-Length header received.");
                     // This is likely an error in message framing from the server or our reader.
                     // We might lose sync here. Consider if we should attempt to resync or just error out.
@@ -157,10 +157,10 @@ impl LspClient {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr_reader).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                logging::add_log_entry(LogSource::WatcherLspServerStderr, LogLevel::Warn, format!("LSP Server stderr: {}", line));
+                log::add_log_entry(LogSource::WatcherLspServerStderr, LogLevel::Warn, format!("LSP Server stderr: {}", line));
                 tracing::warn!(target: "galatea::dev_runtime::lsp_client::stderr_reader", "LSP Server: {}", line);
             }
-            logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "LSP stderr task finished.".to_string());
+            log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "LSP stderr task finished.".to_string());
             tracing::info!(target: "galatea::dev_runtime::lsp_client::stderr_reader", "LSP stderr task finished.");
         });
 
@@ -180,7 +180,7 @@ impl LspClient {
         let rpc_string = serde_json::to_string(&rpc).context("Failed to serialize JsonRpc to string")?; // Use serde_json::to_string
         let message = format!("Content-Length: {}\\r\\n\\r\\n{}", rpc_string.len(), rpc_string);
 
-        logging::add_log_entry(LogSource::WatcherLspClientRequest, LogLevel::Debug, format!("Sending LSP RPC: Method '{:?}', ID '{:?}'", rpc.get_method(), rpc.get_id()));
+        log::add_log_entry(LogSource::WatcherLspClientRequest, LogLevel::Debug, format!("Sending LSP RPC: Method '{:?}', ID '{:?}'", rpc.get_method(), rpc.get_id()));
         tracing::trace!(target: "galatea::dev_runtime::lsp_client", "Sending LSP message: {}", message);
         
         self.writer
@@ -221,7 +221,7 @@ impl LspClient {
               Ok(Some(response_candidate)) => {
                   match response_candidate.get_id() {
                       Some(id) if id == request_id.clone() => {
-                          logging::add_log_entry(
+                          log::add_log_entry(
                               LogSource::WatcherLspClientResponse,
                               LogLevel::Debug, 
                               format!("Received matching LSP response for ID {:?}: {:?}", request_id, response_candidate)
@@ -230,7 +230,7 @@ impl LspClient {
                       }
                       Some(other_id) => {
                           let log_level = if response_candidate.get_method().is_some() { LogLevel::Warn } else { LogLevel::Debug };
-                          logging::add_log_entry(
+                          log::add_log_entry(
                               if response_candidate.get_method().is_some() { LogSource::WatcherLspClientNotification } else { LogSource::WatcherLspClientResponse }, 
                               log_level, 
                               format!(
@@ -280,7 +280,7 @@ impl LspClient {
                               },
                           );
 
-                          logging::add_log_entry(
+                          log::add_log_entry(
                               LogSource::WatcherLspClientNotification, // Server-initiated notification
                               LogLevel::Debug,
                               format!(
@@ -300,7 +300,7 @@ impl LspClient {
                       "LSP response channel closed while waiting for request ID {:?}",
                       request_id
                   );
-                  logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
+                  log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, err_msg.clone());
                   return Err(anyhow!(err_msg))
               }
               Err(_) => {
@@ -308,7 +308,7 @@ impl LspClient {
                       "Timeout waiting for LSP response for request ID {:?}",
                       request_id
                   );
-                  logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, timeout_msg.clone());
+                  log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Error, timeout_msg.clone());
                   return Err(anyhow!(timeout_msg))
               } // Elapsed
           }
@@ -346,7 +346,7 @@ impl LspClient {
           locale: None, 
           work_done_progress_params: WorkDoneProgressParams::default(),
       };
-      logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "Sending LSP Initialize request".to_string());
+      log::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, "Sending LSP Initialize request".to_string());
       let request_id = self
           .send_request(
               lsp_types::request::Initialize::METHOD,
@@ -361,7 +361,7 @@ impl LspClient {
           .await
           .context("Waiting for Initialize response from LSP failed")?;
 
-      logging::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, format!("Received LSP Initialize response: {:?}", response_rpc.get_result().is_some()));
+      log::add_log_entry(LogSource::WatcherLspClientLifecycle, LogLevel::Info, format!("Received LSP Initialize response: {:?}", response_rpc.get_result().is_some()));
       // Use get_result() on JsonRpc enum directly
       match response_rpc.get_result() {
           Some(result_value) => {
@@ -395,7 +395,7 @@ impl LspClient {
               text,
           },
       };
-      logging::add_log_entry(
+      log::add_log_entry(
           LogSource::WatcherLspClientNotification, // This is client sending a notification
           LogLevel::Info, 
           format!("Sending LSP DidOpenTextDocument notification for {:?}: lang={}, ver={}", uri, language_id, version)
@@ -420,7 +420,7 @@ impl LspClient {
           work_done_progress_params: WorkDoneProgressParams::default(),
           partial_result_params: PartialResultParams::default(),
       };
-      logging::add_log_entry(
+      log::add_log_entry(
           LogSource::WatcherLspClientRequest,
           LogLevel::Info, 
           format!("Sending LSP GotoDefinition request for {:?}:({},{})", uri, position.line, position.character)
@@ -440,7 +440,7 @@ impl LspClient {
           .await
           .context("Waiting for GotoDefinition response from LSP failed")?;
 
-      logging::add_log_entry(
+      log::add_log_entry(
           LogSource::WatcherLspClientResponse, 
           LogLevel::Info, 
           format!("Received LSP GotoDefinition response. Has result: {}", response_rpc.get_result().is_some())
@@ -460,14 +460,14 @@ impl LspClient {
   }
 
     pub async fn close(mut self) -> Result<()> {
-        logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "Closing LSP client and attempting to kill server process.".to_string());
+        log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "Closing LSP client and attempting to kill server process.".to_string());
         tracing::info!(target: "galatea::dev_runtime::lsp_client", "Closing LSP client and attempting to kill server process.");
         
         let exit_params_value = serde_json::Value::Null;
         let params = Params::from(exit_params_value);
         let rpc = JsonRpc::notification_with_params(lsp_types::notification::Exit::METHOD, params.clone());
         if let Err(e) = self.send_rpc(rpc).await {
-            logging::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Warn, format!("Failed to send exit notification to LSP server (proceeding with kill): {}",e));
+            log::add_log_entry(LogSource::WatcherLspClientError, LogLevel::Warn, format!("Failed to send exit notification to LSP server (proceeding with kill): {}",e));
             tracing::warn!(target: "galatea::dev_runtime::lsp_client", "Failed to send exit notification to LSP server: {}", e);
         }
 
@@ -475,21 +475,21 @@ impl LspClient {
 
         match self.child_process.try_wait() {
             Ok(Some(status)) => {
-                logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, format!("LSP server process exited with status: {}", status));
+                log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, format!("LSP server process exited with status: {}", status));
                 tracing::info!(target: "galatea::dev_runtime::lsp_client", "LSP server process already exited with status: {}", status);
             }
             Ok(None) => {
                 tracing::info!(target: "galatea::dev_runtime::lsp_client", "LSP server process still running, attempting to kill.");
                 if let Err(e) = self.child_process.kill().await {
-                    logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Error, format!("Failed to kill LSP server process: {}", e));
+                    log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Error, format!("Failed to kill LSP server process: {}", e));
                     return Err(anyhow!("Failed to kill LSP server process: {}", e));
                 } else {
-                    logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "LSP server process killed successfully.".to_string());
+                    log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Info, "LSP server process killed successfully.".to_string());
                     tracing::info!(target: "galatea::dev_runtime::lsp_client", "LSP server process killed successfully.");
                 }
             }
             Err(e) => {
-                logging::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Error, format!("Error checking LSP server process status: {}", e));
+                log::add_log_entry(LogSource::WatcherLspServerLifecycle, LogLevel::Error, format!("Error checking LSP server process status: {}", e));
                 return Err(anyhow!("Error checking LSP server process status: {}", e));
             }
         }

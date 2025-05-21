@@ -7,7 +7,7 @@ use tracing;
 
 use crate::terminal;
 
-pub async fn start_dev_server(project_dir: &Path) -> Result<()> {
+pub async fn launch_dev_server(project_dir: &Path) -> Result<()> {
     terminal::port::ensure_port_is_free(3000, "Next.js dev server")
         .await
         .context("Failed to ensure Next.js dev server port (3000) is free before starting")?;
@@ -21,7 +21,7 @@ pub async fn start_dev_server(project_dir: &Path) -> Result<()> {
     let mut cmd = TokioCommand::new("npm");
     cmd.current_dir(project_dir);
     cmd.args(&["run", "dev"]);
-    cmd.stdout(Stdio::piped()); 
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().with_context(|| {
@@ -72,9 +72,6 @@ pub async fn start_dev_server(project_dir: &Path) -> Result<()> {
             status
         );
         tracing::error!(target: "dev_runtime::nextjs", source_process = "next_dev_server", "{}", err_msg);
-        Err(anyhow!(
-            "{}",
-            err_msg
-        ))
+        Err(anyhow!("{}", err_msg))
     }
 }
