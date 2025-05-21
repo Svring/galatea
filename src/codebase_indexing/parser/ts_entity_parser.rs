@@ -1,6 +1,6 @@
 use super::helpers::*;
-use super::structs::{CodeContext, CodeEntity};
-use crate::processing::split_entity;
+use super::entities::{CodeContext, CodeEntity};
+use crate::codebase_indexing::postprocessor::split_entity;
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -596,4 +596,4 @@ export const MyComponent = (props: { message: string }) => {
             .contains("A simple TSX component"));
         Ok(())
     }
-}
+} 

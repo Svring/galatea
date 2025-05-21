@@ -1,912 +1,70 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn}; // For return type of initialize_environment
 
 // Use modules
-use galatea::{editor, embedder, hoarder, parser_mod, processing, wanderer, watcher, resolver, debugger, utils, logging};
+use galatea::api; // New api module
+use galatea::dev_operation; // Existing module, may need internal updates
+use galatea::dev_runtime; // Existing, contains logging, nextjs
+use galatea::dev_setup;
+use galatea::file_system; // Existing, contains wanderer, resolver
+use galatea::terminal; // Added for port utilities
 
 // Add Poem imports
 use poem::{
-    endpoint::StaticFilesEndpoint, get, handler, http::{Method, StatusCode}, listener::TcpListener,
-    middleware::Cors, post, web::Data, web::Json, EndpointExt, Route, Server,
+    endpoint::StaticFilesEndpoint,
+    /* get, handler, */ http::{Method /* StatusCode */},
+    listener::TcpListener,
+    middleware::Cors,
+    EndpointExt, Route, Server,
 };
-use serde::{Deserialize, Serialize};
+// Serde is not used directly here anymore
+// use serde::{Deserialize, Serialize};
 use lsp_types::Uri;
 
-// API request/response types
-#[derive(Debug, Serialize, Deserialize)]
-struct FindFilesRequest {
-    dir: String,
-    suffixes: Vec<String>,
-    exclude_dirs: Option<Vec<String>>,
-}
+// API request/response types are now in api::models
+// Uncommented: Moved from debugger.rs and made private, but still used in main
+async fn initialize_environment() -> Result<PathBuf> {
+    let span = tracing::info_span!(target: "galatea::bootstrap", "initialize_environment");
+    let _enter = span.enter();
 
-#[derive(Debug, Serialize, Deserialize)]
-struct FindFilesResponse {
-    files: Vec<String>,
-}
+    tracing::info!(target: "galatea::bootstrap", "Starting project verification and setup...");
+    let project_dir = file_system::get_project_root()
+        .context("Bootstrap: Failed to get project root. Ensure 'project' subdirectory exists next to the executable.")?;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ParseFileRequest {
-    file_path: String,
-    max_snippet_size: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ParseDirectoryRequest {
-    dir: String,
-    suffixes: Vec<String>,
-    exclude_dirs: Option<Vec<String>>,
-    max_snippet_size: Option<usize>,
-    granularity: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QueryRequest {
-    collection_name: String,
-    query_text: String,
-    model: Option<String>,
-    api_key: Option<String>,
-    api_base: Option<String>,
-    qdrant_url: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GenerateEmbeddingsRequest {
-    input_file: String,
-    output_file: String,
-    model: Option<String>,
-    api_key: Option<String>,
-    api_base: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GenericApiResponse {
-    success: bool,
-    message: String,
-    details: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct UpsertEmbeddingsRequest {
-    input_file: String,
-    collection_name: String,
-    qdrant_url: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BuildIndexRequest {
-    dir: String,
-    suffixes: Vec<String>,
-    exclude_dirs: Option<Vec<String>>,
-    max_snippet_size: Option<usize>,
-    granularity: Option<String>, // Will be parsed to enum processing::Granularity
-    embedding_model: Option<String>,
-    api_key: Option<String>,
-    api_base: Option<String>,
-    collection_name: String,
-    qdrant_url: Option<String>,
-}
-
-// Editor API Request Structure
-#[derive(Debug, Serialize, Deserialize)]
-struct EditorCommandRequest {
-    command: String, // "view", "create", "str_replace", "insert", "undo_edit"
-    path: String,    // Required by schema, value might be ignored for 'undo_edit'
-    file_text: Option<String>,
-    insert_line: Option<usize>, // 1-indexed
-    new_str: Option<String>,
-    old_str: Option<String>,
-    view_range: Option<Vec<isize>>, // [start_line, end_line], 1-indexed, end_line = -1 for to_end
-}
-
-// Editor API Response Structure
-#[derive(Debug, Serialize, Deserialize)]
-struct EditorCommandResponse {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>, // For view command and now for all file modification operations
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    operation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    modified_at: Option<String>, // ISO timestamp
-    #[serde(skip_serializing_if = "Option::is_none")]
-    modified_lines: Option<Vec<usize>>, // Line numbers affected
-}
-
-// Watcher API Payloads
-
-// ESLint
-#[derive(Debug, Serialize, Deserialize)]
-struct LintRequest {
-    // paths: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LintResponse {
-    results: Vec<watcher::EslintResult>,
-}
-
-// New response struct for lint status
-#[derive(Debug, Serialize, Deserialize)]
-struct LintStatusResponse {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    results: Option<Vec<watcher::EslintResult>>,
-}
-
-// Prettier Write
-#[derive(Debug, Serialize, Deserialize)]
-struct FormatWriteRequest {
-}
-
-// New response struct for format status
-#[derive(Debug, Serialize, Deserialize)]
-struct FormatStatusResponse {
-    success: bool,
-    message: String,
-    // Optionally, could add a field for details if watcher::run_format ever returns more info
-    // formatted_files: Option<Vec<String>>, 
-}
-
-// LSP - Goto Definition
-#[derive(Debug, Serialize, Deserialize)]
-struct GotoDefinitionApiRequest {
-    uri: String,    // e.g., "file:///path/to/project/file.ts" or a partial path
-    line: u32,      // 0-indexed
-    character: u32, // 0-indexed
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GotoDefinitionApiResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    locations: Option<lsp_types::GotoDefinitionResponse>,
-}
-
-// package.json API Response - uses watcher::PackageJsonData directly
-
-// Log API Request/Response types
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct GetLogsRequest {
-    #[serde(flatten)]
-    filter_options: logging::LogFilterOptions,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GetLogsResponse {
-    success: bool,
-    logs: Vec<logging::LogEntry>,
-    count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ClearLogsResponse {
-    success: bool,
-    message: String,
-}
-
-#[handler]
-async fn health() -> &'static str {
-    "Galatea API is running"
-}
-
-#[handler]
-async fn find_files(
-    Json(req): Json<FindFilesRequest>,
-) -> Result<Json<FindFilesResponse>, poem::Error> {
-    let dir = std::path::PathBuf::from(&req.dir);
-    let suffixes_ref: Vec<&str> = req.suffixes.iter().map(|s| s.as_str()).collect();
-    let exclude_dirs = req.exclude_dirs.unwrap_or_else(|| {
-        vec![
-            "node_modules".to_string(),
-            "target".to_string(),
-            "dist".to_string(),
-            "build".to_string(),
-            ".git".to_string(),
-            ".vscode".to_string(),
-            ".idea".to_string(),
-        ]
-    });
-    let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-    
-    match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
-        Ok(found_files) => {
-            let file_paths = found_files
-                .iter()
-                .map(|path| path.to_string_lossy().to_string())
-                .collect();
-            Ok(Json(FindFilesResponse { files: file_paths }))
-        }
-        Err(e) => Err(poem::Error::from_string(
-            format!("Error searching directory: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
-
-#[handler]
-async fn parse_file(
-    Json(req): Json<ParseFileRequest>,
-) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    let file_path = match resolver::resolve_path(&req.file_path) {
-        Ok(p) => p,
-        Err(e) => return Err(poem::Error::from_string(e.to_string(), StatusCode::BAD_REQUEST)),
-    };
-    
-    if !file_path.exists() {
-        return Err(poem::Error::from_string(
-            format!("File not found: {}", file_path.display()),
-            StatusCode::NOT_FOUND,
-        ));
-    }
-    
-    let extension = file_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .ok_or_else(|| {
-            poem::Error::from_string("File has no extension", StatusCode::BAD_REQUEST)
-        })?;
-        
-    let parse_result = match extension {
-        "rs" => parser_mod::extract_rust_entities_from_file(&file_path, req.max_snippet_size),
-        "ts" => parser_mod::extract_ts_entities(&file_path, false, req.max_snippet_size),
-        "tsx" => parser_mod::extract_ts_entities(&file_path, true, req.max_snippet_size),
-        _ => Err(anyhow::anyhow!("Unsupported file extension: {}", extension)),
-    };
-    
-    match parse_result {
-        Ok(entities) => Ok(Json(entities)),
-        Err(e) => Err(poem::Error::from_string(
-            format!("Error parsing file: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
-
-#[handler]
-async fn parse_directory(
-    Json(req): Json<ParseDirectoryRequest>,
-) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    let dir = std::path::PathBuf::from(&req.dir);
-    let suffixes_ref: Vec<&str> = req.suffixes.iter().map(|s| s.as_str()).collect();
-    let exclude_dirs = req.exclude_dirs.unwrap_or_else(|| {
-        vec![
-            "node_modules".to_string(),
-            "target".to_string(),
-            "dist".to_string(),
-            "build".to_string(),
-            ".git".to_string(),
-            ".vscode".to_string(),
-            ".idea".to_string(),
-        ]
-    });
-    let exclude_dirs_ref: Vec<&str> = exclude_dirs.iter().map(|s| s.as_str()).collect();
-    
-    let granularity = match req.granularity.as_deref() {
-        Some("coarse") => processing::Granularity::Coarse,
-        Some("medium") => processing::Granularity::Medium,
-        _ => processing::Granularity::Fine,
-    };
-    
-    let files_to_parse =
-        match wanderer::find_files_by_extensions(&dir, &suffixes_ref, &exclude_dirs_ref) {
-        Ok(files) => files,
-            Err(e) => {
-                return Err(poem::Error::from_string(
-            format!("Error finding files: {}", e),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-        ))
-            }
-    };
-    
-    if files_to_parse.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
-    
-    let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
-    for file_path in files_to_parse {
-        let extension = file_path.extension().and_then(|ext| ext.to_str());
-        let parse_result = match extension {
-            Some("rs") => {
-                parser_mod::extract_rust_entities_from_file(&file_path, req.max_snippet_size)
-            }
-            Some("ts") => parser_mod::extract_ts_entities(&file_path, false, req.max_snippet_size),
-            Some("tsx") => parser_mod::extract_ts_entities(&file_path, true, req.max_snippet_size),
-            _ => continue,
-        };
-        
-        if let Ok(entities) = parse_result {
-            all_entities.extend(entities);
-        }
-    }
-    
-    let final_entities =
-        processing::post_process_entities(all_entities, granularity, req.max_snippet_size);
-    Ok(Json(final_entities))
-}
-
-#[handler]
-async fn query_collection(
-    Json(req): Json<QueryRequest>,
-) -> Result<Json<Vec<parser_mod::CodeEntity>>, poem::Error> {
-    info!(target: "galatea::api", collection_name = %req.collection_name, query_text = %req.query_text, "API query request");
-
-    let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
-
-    match hoarder::query(
-        &req.collection_name,
-        &req.query_text,
-        req.model,
-        req.api_key,
-        req.api_base,
-        qdrant_url,
-    )
-    .await
-    {
-        Ok(entities) => Ok(Json(entities)),
-        Err(e) => {
-            error!(target: "galatea::api", error = ?e, collection_name = %req.collection_name, "Error in API query_collection");
-            Err(poem::Error::from_string(
-                format!("Error querying collection: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-}
-
-#[handler]
-async fn generate_embeddings_api(
-    Json(req): Json<GenerateEmbeddingsRequest>,
-) -> Result<Json<GenericApiResponse>, poem::Error> {
-    info!(target: "galatea::api", input_file = %req.input_file, output_file = %req.output_file, "API request to generate embeddings");
-
-    let input_path = std::path::PathBuf::from(&req.input_file);
-    let output_path = std::path::PathBuf::from(&req.output_file);
-
-    if !input_path.exists() {
-        return Err(poem::Error::from_string(
-            format!("Input file not found: {}", req.input_file),
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-
-    match embedder::generate_embeddings_for_index(
-        &input_path, 
-        &output_path, 
-        req.model, 
-        req.api_key, 
-        req.api_base,
-    )
-    .await
-    {
-        Ok(_) => Ok(Json(GenericApiResponse {
-            success: true,
-            message: "Embeddings generated successfully.".to_string(),
-            details: Some(format!("Output written to {}", req.output_file)),
-        })),
-        Err(e) => {
-            error!(target: "galatea::api", error = ?e, input_file = %req.input_file, "Error in API generate_embeddings_api");
-            Err(poem::Error::from_string(
-                format!("Failed to generate embeddings: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-}
-
-#[handler]
-async fn upsert_embeddings_api(
-    Json(req): Json<UpsertEmbeddingsRequest>,
-) -> Result<Json<GenericApiResponse>, poem::Error> {
-    info!(target: "galatea::api", input_file = %req.input_file, collection_name = %req.collection_name, "API request to upsert embeddings");
-
-    let input_path = std::path::PathBuf::from(&req.input_file);
-    let qdrant_url = req.qdrant_url.as_deref().unwrap_or("http://localhost:6334");
-
-    if !input_path.exists() {
-        return Err(poem::Error::from_string(
-            format!("Input file not found: {}", req.input_file),
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-
-    // Ensure collection exists (optional, create_collection is idempotent)
-    if let Err(e) = hoarder::create_collection(&req.collection_name, qdrant_url).await {
-        warn!(target: "galatea::api", error = ?e, collection_name = %req.collection_name, "Error creating collection (it might already exist or Qdrant is down)");
-        // Decide if this is a hard error or if we can proceed assuming it might exist.
-        // For now, let's proceed, as upsert will fail if collection doesn't exist and couldn't be created.
-    }
-
-    match hoarder::upsert_embeddings(&req.collection_name, &input_path, qdrant_url).await {
-        Ok(_) => Ok(Json(GenericApiResponse {
-            success: true,
-            message: "Embeddings upserted successfully.".to_string(),
-            details: Some(format!(
-                "Upserted from {} to collection {}",
-                req.input_file, req.collection_name
-            )),
-        })),
-        Err(e) => {
-            error!(target: "galatea::api", error = ?e, input_file = %req.input_file, collection_name = %req.collection_name, "Error in API upsert_embeddings_api");
-            Err(poem::Error::from_string(
-                format!("Failed to upsert embeddings: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-}
-
-#[handler]
-async fn build_index_api(
-    Json(req): Json<BuildIndexRequest>,
-) -> Result<Json<GenericApiResponse>, poem::Error> {
-    info!(target: "galatea::api::build_index", directory = %req.dir, collection_name = %req.collection_name, "API request to build index (background task)");
-
-    let qdrant_url_for_spawn = req
-        .qdrant_url
-        .clone()
-        .unwrap_or_else(|| "http://localhost:6334".to_string());
-
-    // Clone all necessary data from req to move into the spawned task
-    let dir_clone = req.dir.clone();
-    let suffixes_clone: Vec<String> = req.suffixes.clone(); // Clone into Vec<String>
-    let exclude_dirs_clone = req.exclude_dirs.clone();
-    let max_snippet_size_clone = req.max_snippet_size;
-    let granularity_str_clone = req.granularity.clone();
-    let embedding_model_clone = req.embedding_model.clone();
-    let api_key_clone = req.api_key.clone();
-    let api_base_clone = req.api_base.clone();
-    let collection_name_clone = req.collection_name.clone();
-
-    // For long-running tasks like this, it's better to spawn a new task
-    // so the HTTP request can return quickly.
-    tokio::spawn(async move {
-        let qdrant_url_inner = qdrant_url_for_spawn; // Use the URL captured for the spawn
-        let dir_path = std::path::PathBuf::from(dir_clone); // Use cloned data
-        let suffixes_ref: Vec<&str> = suffixes_clone.iter().map(|s| s.as_str()).collect();
-        
-        let default_exclude_dirs = vec![
-            "node_modules".to_string(),
-            "target".to_string(),
-            "dist".to_string(),
-            "build".to_string(),
-            ".git".to_string(),
-            ".vscode".to_string(),
-            ".idea".to_string(),
-        ];
-        let exclude_dirs_owned = exclude_dirs_clone.unwrap_or(default_exclude_dirs);
-        let exclude_dirs_ref: Vec<&str> = exclude_dirs_owned.iter().map(|s| s.as_str()).collect();
-        
-        let granularity = match granularity_str_clone.as_deref() {
-            // Use cloned data
-            Some("coarse") => processing::Granularity::Coarse,
-            Some("medium") => processing::Granularity::Medium,
-            Some("fine") => processing::Granularity::Fine,
-            _ => processing::Granularity::Fine, // Default to fine
-        };
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Starting Full Index Build (API Triggered)");
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[1/4] Finding files...");
-        let files_to_parse =
-            match wanderer::find_files_by_extensions(&dir_path, &suffixes_ref, &exclude_dirs_ref) {
-            Ok(files) => files,
-            Err(e) => {
-                error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Wander step failed");
-                return;
-            }
-        };
-        if files_to_parse.is_empty() { 
-            info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "No matching files found. Index build cancelled.");
-            return; 
-        }
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = files_to_parse.len(), "Found files.");
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[2/4] Parsing files...");
-        let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
-        for file_path in files_to_parse {
-            let extension = file_path.extension().and_then(|ext| ext.to_str());
-            let parse_result = match extension {
-                Some("rs") => {
-                    parser_mod::extract_rust_entities_from_file(&file_path, max_snippet_size_clone)
-                }
-                Some("ts") => {
-                    parser_mod::extract_ts_entities(&file_path, false, max_snippet_size_clone)
-                }
-                Some("tsx") => {
-                    parser_mod::extract_ts_entities(&file_path, true, max_snippet_size_clone)
-                }
-                _ => {
-                    continue;
-                }
-            };
-            match parse_result {
-                Ok(entities) => all_entities.extend(entities),
-                Err(e) => {
-                    error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, file_path = %file_path.display(), "Error parsing file. Skipping.");
-                }
-            }
-        }
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = all_entities.len(), "Parsed initial entities.");
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", ?granularity, "[2b/4] Post-processing entities...");
-        let processed_entities =
-            processing::post_process_entities(all_entities, granularity, max_snippet_size_clone);
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", count = processed_entities.len(), "Entities after post-processing.");
-        if processed_entities.is_empty() { 
-            info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "No entities after processing. Index build cancelled.");
-            return; 
-        }
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "[3/4] Generating embeddings...");
-        let entities_with_embeddings = match embedder::generate_embeddings_for_vec(
-            processed_entities,
-            embedding_model_clone, // Use cloned data
-            api_key_clone,         // Use cloned data
-            api_base_clone,        // Use cloned data
-        )
+    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir.display(), "Ensuring full development environment setup...");
+    dev_setup::ensure_development_environment(&project_dir)
         .await
-        {
-            Ok(entities) => entities,
-            Err(e) => {
-                error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Embedding step failed");
-                return;
-            }
-        };
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Embeddings generated.");
-        if entities_with_embeddings
-            .iter()
-            .all(|e| e.embedding.is_none())
-        {
-            warn!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "Warning: No entities had embeddings generated successfully.");
-        }
+        .context("Bootstrap: Failed to ensure development environment setup (Next.js deps/scripts/config, .codex folder).")?;
+    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir.display(), "Development environment setup ensured.");
 
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", collection_name = %collection_name_clone, "[4/4] Storing embeddings in Qdrant collection...");
-        if let Err(e) = hoarder::create_collection(&collection_name_clone, &qdrant_url_inner).await
-        {
-            // Use cloned data
-            error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, collection_name = %collection_name_clone, "Failed to ensure Qdrant collection exists");
-            return;
-        }
-        if let Err(e) = hoarder::upsert_entities_from_vec(
-            &collection_name_clone,
-            entities_with_embeddings,
-            &qdrant_url_inner,
-        )
-        .await
-        {
-            // Use cloned data
-            error!(target: "galatea::build_index_task", source_component = "build_index_pipeline", error = ?e, "Upserting embeddings to Qdrant failed");
-            return;
-        }
-
-        info!(target: "galatea::build_index_task", source_component = "build_index_pipeline", "--- Index Build Complete (API Triggered) ---");
-    });
-
-    Ok(Json(GenericApiResponse {
-        success: true,
-        message: "Build index process started in the background.".to_string(),
-        details: Some(format!(
-            "Building index for dir '{}' into collection '{}'. Check server logs for progress.",
-            req.dir, req.collection_name
-        )),
-    }))
+    tracing::info!(target: "galatea::bootstrap", "Project verification and setup completed successfully.");
+    Ok(project_dir)
 }
 
-#[handler]
-async fn editor_command_api(
-    editor_data: Data<&Arc<Mutex<editor::Editor>>>,
-    Json(req): Json<EditorCommandRequest>,
-) -> Result<Json<EditorCommandResponse>, poem::Error> {
-    let command_type = match req.command.as_str() {
-        "view" => editor::CommandType::View,
-        "create" => editor::CommandType::Create,
-        "str_replace" => editor::CommandType::StrReplace,
-        "insert" => editor::CommandType::Insert,
-        "undo_edit" => editor::CommandType::UndoEdit,
-        _ => {
-            return Err(poem::Error::from_string(
-                format!("Invalid command type: {}", req.command),
-                StatusCode::BAD_REQUEST,
-            ))
-        }
-    };
-
-    // Resolve the path, except for 'undo_edit' which might not need a path
-    // or its path meaning is different (e.g. last edited file, handled by Editor state).
-    // For simplicity, we'll resolve it. If Editor can handle relative/unresolved paths for undo context, that's fine.
-    let resolved_req_path = match resolver::resolve_path(&req.path) {
-        Ok(p) => p,
-        Err(e) => return Err(poem::Error::from_string(e.to_string(), StatusCode::BAD_REQUEST)),
-    };
-
-    // Ensure the path exists for commands that operate on existing files, if necessary.
-    // 'create' doesn't need it to exist. 'view', 'str_replace', 'insert' likely do.
-    // 'undo_edit' might operate on a path that was just deleted, or a conceptual path.
-    if command_type != editor::CommandType::Create && 
-       command_type != editor::CommandType::UndoEdit && // Assuming undo might not need path to exist right now
-       !resolved_req_path.exists() {
-        return Err(poem::Error::from_string(
-            format!("File not found at resolved path: {}", resolved_req_path.display()),
-            StatusCode::NOT_FOUND,
-        ));
-    }
-
-    // Get current timestamp
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
-
-    // Path is required by EditorArgs and API schema
-    let editor_args = editor::EditorArgs {
-        command: command_type,
-        path: resolved_req_path.to_string_lossy().into_owned(), // Use resolved path
-        file_text: req.file_text.clone(),
-        insert_line: req.insert_line,
-        new_str: req.new_str.clone(),
-        old_str: req.old_str.clone(),
-        view_range: req.view_range.clone(),
-    };
-
-    let mut editor_guard = editor_data.0.lock().await;
-    match editor::handle_command(&mut editor_guard, editor_args) {
-        Ok(Some(content)) => {
-            // View command already returns content
-            Ok(Json(EditorCommandResponse {
-                success: true,
-                message: Some(format!("Command '{}' executed successfully.", req.command)),
-                content: Some(content.clone()),
-                file_path: Some(resolved_req_path.to_string_lossy().into_owned()),
-                operation: Some(req.command.clone()),
-                line_count: Some(content.lines().count()),
-                modified_at: Some(timestamp),
-                modified_lines: None,
-            }))
-        },
-        Ok(None) => {
-            // Non-view commands now need to fetch content to return it
-            let mut response = EditorCommandResponse {
-                success: true,
-                message: Some(format!("Command '{}' executed successfully.", req.command)),
-                content: None,
-                file_path: Some(resolved_req_path.to_string_lossy().into_owned()),
-                operation: Some(req.command.clone()),
-                modified_at: Some(timestamp),
-                line_count: Some(0), // Default to 0 lines until we get actual content
-                modified_lines: None,
-            };
-            
-            // For create, str_replace, insert - fetch the updated content
-            if req.command == "create" || req.command == "str_replace" || req.command == "insert" || req.command == "undo_edit" {
-                // Create a view command to fetch the content, using the resolved path of the original request
-                let view_args = editor::EditorArgs {
-                    command: editor::CommandType::View,
-                    path: resolved_req_path.to_string_lossy().into_owned(), // Use resolved path
-                    file_text: None,
-                    insert_line: None,
-                    new_str: None,
-                    old_str: None,
-                    view_range: None, // view the whole file
-                };
-                
-                if let Ok(Some(updated_content)) = editor::handle_command(&mut editor_guard, view_args) {
-                    response.content = Some(updated_content.clone());
-                    response.line_count = Some(updated_content.lines().count());
-                    
-                    // For str_replace, try to estimate affected lines
-                    if req.command == "str_replace" && req.old_str.is_some() {
-                        // Simple approach: count line breaks in old_str to estimate affected lines
-                        // For a more precise approach, we would need to track changes in the editor module
-                        if let Some(old_str) = &req.old_str {
-                            let line_count = old_str.lines().count();
-                            if line_count > 0 && line_count < 100 { // Reasonable limit
-                                response.modified_lines = Some((1..=line_count).collect());
-                            }
-                        }
-                    }
-                    
-                    // For insert, we know the affected line
-                    if req.command == "insert" && req.insert_line.is_some() {
-                        response.modified_lines = Some(vec![req.insert_line.unwrap()]);
-                    }
-                }
-            }
-            
-            Ok(Json(response))
-        },
-        Err(e) => Err(poem::Error::from_string(
-            e,
-            StatusCode::BAD_REQUEST,
-        )),
+// New function to encapsulate the Next.js server spawning logic
+async fn launch_nextjs_dev_server_task(project_directory: PathBuf) {
+    let span = tracing::info_span!(target: "galatea::main", "nextjs_dev_server_supervisor");
+    let _enter = span.enter();
+    info!(target: "galatea::main", source_component = "next_dev_server_supervisor", path = %project_directory.display(), "Attempting to start the Next.js development server...");
+    if let Err(e) = dev_runtime::nextjs::start_dev_server(&project_directory).await {
+        error!(target: "galatea::main", source_component = "next_dev_server_supervisor", error = ?e, "Failed to start or monitor the Next.js development server.");
+    } else {
+        info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Next.js development server process has finished.");
     }
 }
 
-#[handler]
-async fn lint_api(Json(_req): Json<LintRequest>) -> Result<Json<LintStatusResponse>, poem::Error> {
-    match watcher::run_eslint().await {
-        Ok(results) => {
-            if results.is_empty() {
-                Ok(Json(LintStatusResponse {
-                    success: true,
-                    message: Some("No lint errors found.".to_string()),
-                    results: None,
-                }))
-            } else {
-                Ok(Json(LintStatusResponse {
-                    success: true,
-                    message: Some(format!("{} lint issue(s) found.", results.len())),
-                    results: Some(results),
-                }))
-            }
-        }
-        Err(e) => Err(poem::Error::from_string(
-            format!("Error running ESLint: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
+async fn launch_api_server(host: &str, port: u16) -> Result<()> {
+    let span = tracing::info_span!(target: "galatea::main", "start_server", %host, %port);
+    let _enter = span.enter();
 
-#[handler]
-async fn format_api(
-    Json(_req): Json<FormatWriteRequest>,
-) -> Result<Json<FormatStatusResponse>, poem::Error> {
-    match watcher::run_format().await {
-        Ok(_formatted_files) => {
-            Ok(Json(FormatStatusResponse {
-                success: true,
-                message: "Formatting process completed successfully.".to_string(),
-            }))
-        }
-        Err(e) => Err(poem::Error::from_string(
-            format!("Error formatting with Prettier: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
+    // Editor state is now managed by editor_api routes if needed, passed via api_routes
+    // let editor_state = Arc::new(Mutex::new(dev_operation::editor::Editor::new()));
 
-#[handler]
-async fn lsp_goto_definition_api(
-    lsp_client_data: Data<&Arc<Mutex<watcher::LspClient>>>,
-    Json(req): Json<GotoDefinitionApiRequest>,
-) -> Result<Json<GotoDefinitionApiResponse>, poem::Error> {
-    // 1. Resolve the input string (which could be a URI string or a partial path)
-    //    to a canonical PathBuf using the resolver module.
-    let resolved_file_path: std::path::PathBuf = match resolver::resolve_path(&req.uri) {
-        Ok(p) => p,
-        Err(e) => { // e is anyhow::Error
-            return Err(poem::Error::from_string(
-                format!(
-                    "Failed to resolve input path/URI '{}' to a project file: {}",
-                    req.uri,
-                    e.to_string()
-                ),
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-    };
-
-    let file_uri = match resolver::resolve_path_to_uri(&req.uri) {
-        Ok(uri) => uri,
-        Err(e) => {
-            return Err(poem::Error::from_string(
-                format!("Failed to resolve input path/URI '{}' to a project file: {}", req.uri, e.to_string()),
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-    };
-    
-    let file_content = match std::fs::read_to_string(&resolved_file_path) {
-        Ok(content) => content,
-        Err(e) => {
-            return Err(poem::Error::from_string(
-                format!(
-                    "Failed to read file for LSP didOpen '{}': {}",
-                    resolved_file_path.display(),
-                    e
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
-        }
-    };
-
-    let position = lsp_types::Position {
-        line: req.line,
-        character: req.character,
-    };
-
-    let mut client_guard = lsp_client_data.0.lock().await;
-
-    let language_id = resolved_file_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map_or_else(
-            || "plaintext".to_string(),
-            |ext| match ext {
-                "ts" => "typescript".to_string(),
-                "tsx" => "typescriptreact".to_string(),
-                "js" => "javascript".to_string(),
-                "jsx" => "javascriptreact".to_string(),
-                "json" => "json".to_string(),
-                _ => "plaintext".to_string(),
-            },
-        );
-
-    if let Err(e) = client_guard
-        .notify_did_open(file_uri.clone(), &language_id, 0, file_content)
-        .await
-    {
-        eprintln!(
-            "LSP notify_did_open failed (continuing to goto_definition): {}",
-            e
-        );
-    }
-
-    match client_guard.goto_definition(file_uri, position).await {
-        Ok(locations) => Ok(Json(GotoDefinitionApiResponse { locations })),
-        Err(e) => Err(poem::Error::from_string(
-            format!("LSP goto_definition failed: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    }
-}
-
-// --- Log Handlers ---
-#[handler]
-async fn get_logs_api(
-    Json(req): Json<GetLogsRequest>,
-) -> Result<Json<GetLogsResponse>, poem::Error> {
-    info!(target: "galatea::api::logs", filter_options = ?req.filter_options, "API request to get logs");
-    match logging::get_shared_logs(req.filter_options) {
-        Ok(logs) => Ok(Json(GetLogsResponse {
-            success: true,
-            count: logs.len(),
-            logs,
-        })),
-        Err(e) => {
-            error!(target: "galatea::api::logs", error = ?e, "Error fetching logs");
-            Err(poem::Error::from_string(
-                format!("Failed to get logs: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-}
-
-#[handler]
-async fn clear_logs_api() -> Result<Json<ClearLogsResponse>, poem::Error> {
-    info!(target: "galatea::api::logs", "API request to clear logs");
-    match logging::clear_shared_logs() {
-        Ok(_) => Ok(Json(ClearLogsResponse {
-            success: true,
-            message: "Logs cleared successfully.".to_string(),
-        })),
-        Err(e) => {
-            error!(target: "galatea::api::logs", error = ?e, "Error clearing logs");
-            Err(poem::Error::from_string(
-                format!("Failed to clear logs: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-}
-// --- End Log Handlers ---
-
-async fn start_server(host: &str, port: u16) -> Result<()> {
-    let editor_state = Arc::new(Mutex::new(editor::Editor::new()));
-
-    let lsp_client = match watcher::LspClient::new().await {
+    // LSP Client Setup - passed via api_routes
+    let lsp_client = match dev_runtime::lsp_client::LspClient::new().await {
         Ok(client) => client,
         Err(e) => {
             error!(target: "galatea::main", source_component = "lsp_client_setup", error = ?e, "Failed to initialize LSP client. LSP features will be unavailable.");
@@ -914,13 +72,16 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
         }
     };
 
-    let project_root_path =
-        resolver::get_project_root() // Use resolver::get_project_root
-            .map_err(|e| anyhow::anyhow!("Failed to get project root for LSP: {}", e))?;
-    
-    // Convert project_root_path to an LspUri for the LSP client initialize method
-    let root_uri: Uri = resolver::resolve_path_to_uri(&project_root_path)
-        .map_err(|e| anyhow::anyhow!("Failed to resolve project root path {} to a URI: {}", project_root_path.display(), e))?;
+    let project_root_path = file_system::get_project_root()
+        .map_err(|e| anyhow::anyhow!("Failed to get project root for LSP: {}", e))?;
+
+    let root_uri: Uri = file_system::resolve_path_to_uri(&project_root_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to resolve project root path {} to a URI: {}",
+            project_root_path.display(),
+            e
+        )
+    })?;
 
     let client_capabilities = lsp_types::ClientCapabilities::default();
     let mut lsp_client_instance = lsp_client;
@@ -933,42 +94,32 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
     }
 
     let lsp_client_state = Arc::new(Mutex::new(lsp_client_instance));
-
-    let api_app = Route::new()
-        .at("/health", get(health))
-        .at("/find-files", post(find_files))
-        .at("/parse-file", post(parse_file))
-        .at("/parse-directory", post(parse_directory))
-        .at("/query", post(query_collection))
-        .at("/generate-embeddings", post(generate_embeddings_api))
-        .at("/upsert-embeddings", post(upsert_embeddings_api))
-        .at("/build-index", post(build_index_api))
-        .at("/editor", post(editor_command_api))
-        .at("/lint", post(lint_api))
-        .at("/format", post(format_api))
-        .at("/lsp/goto-definition", post(lsp_goto_definition_api))
-        .at("/logs/get", post(get_logs_api))
-        .at("/logs/clear", post(clear_logs_api))
-        .with(
-            Cors::new()
-            .allow_credentials(true)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(["Content-Type", "Authorization"]),
-        );
+    let editor_state = Arc::new(Mutex::new(dev_operation::editor::Editor::new()));
 
     // Static files endpoint that serves the React app from ./dist
-    // Use correct path configuration to handle absolute paths in the built React app
     let static_files = StaticFilesEndpoint::new("./dist").index_file("index.html");
 
     let app = Route::new()
-        .nest("/api", api_app)
-        // Serve static files directly from the root path
-        .nest("/", static_files);
+        .nest("/api", api::api_routes()) // Use the new api_routes from the api module
+        .nest("/", static_files)
+        .with(
+            Cors::new()
+                .allow_credentials(true)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers(["Content-Type", "Authorization"]),
+        );
+
+    // Use ensure_port_is_free from the terminal module
+    terminal::port::ensure_port_is_free(port, "Galatea main server (pre-bind check)")
+        .await
+        .context("Failed to ensure Galatea server port was free immediately before binding")?;
 
     info!(target: "galatea::main", source_component = "server_startup", host, port, "Starting Galatea server");
     info!(target: "galatea::main", source_component = "server_startup", "Serving API at /api and static files from ./dist at / ");
     Server::new(TcpListener::bind(format!("{}:{}", host, port)))
-        .run(app.data(editor_state).data(lsp_client_state)) // Add lsp_client_state
+        // Pass necessary states. Editor state might only be needed by editor_api routes.
+        // LspClient state is needed by lsp_api routes.
+        .run(app.data(editor_state).data(lsp_client_state))
         .await
         .map_err(|e| anyhow::anyhow!("Server error: {}", e))
 }
@@ -976,40 +127,34 @@ async fn start_server(host: &str, port: u16) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
-    // Ensure Galatea server port (3051) is free before any other setup
-    if let Err(e) = utils::ensure_port_is_free(3051, "Galatea main server").await {
-        error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to ensure port 3051 is free for Galatea server. Server will not start.");
-        return Err(e.context("Failed to free port 3051 for Galatea server"));
-    }
-    
-    // Verify and set up the project environment using the debugger module
-    if let Err(e) = debugger::verify_and_setup_project().await {
-        error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to verify and set up project environment. Server will not start.");
-        return Err(e); 
-    }
-    info!(target: "galatea::main", source_component = "bootstrap", "Project environment verified and set up successfully.");
+    info!(target: "galatea::main", "Galatea application starting...");
 
-    // Start the Next.js dev server in the background
-    tokio::spawn(async move {
-        match resolver::get_project_root() {
-            Ok(project_root) => {
-                info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Attempting to start the Next.js development server...");
-                if let Err(e) = debugger::start_dev_server(&project_root).await {
-                    error!(target: "galatea::main", source_component = "next_dev_server_supervisor", error = ?e, "Failed to start or monitor the Next.js development server.");
-                } else {
-                    info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Next.js development server process has finished.");
-                }
-            }
-            Err(e) => {
-                error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to get project root for starting dev server. Dev server will not start.");
-            }
+    info!(target: "galatea::main", "Phase 1: Initializing environment...");
+    let project_directory = match initialize_environment().await {
+        Ok(dir) => {
+            info!(target: "galatea::main", source_component = "bootstrap", path = %dir.display(), "Project environment verified and set up successfully.");
+            dir
         }
-    });
-    
+        Err(e) => {
+            error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to verify and set up project environment. Server will not start.");
+            return Err(e);
+        }
+    };
+    info!(target: "galatea::main", "Phase 1: Environment initialized successfully.");
+
+    info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)...");
+    // Call the new function within tokio::spawn
+    tokio::spawn(launch_nextjs_dev_server_task(project_directory.clone()));
+
     // Default server settings
     let host = "0.0.0.0";
     let port = 3051;
-    
-    start_server(host, port).await
+
+    info!(target: "galatea::main", "Phase 3: Starting main API server...");
+    if let Err(e) = launch_api_server(host, port).await {
+        error!(target: "galatea::main", error = ?e, "Failed to start API server. Application will exit.");
+        return Err(e);
+    }
+    info!(target: "galatea::main", "Galatea application shutdown.");
+    Ok(())
 }

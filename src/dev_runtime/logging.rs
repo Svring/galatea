@@ -6,26 +6,30 @@ use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum LogSource {
-    // Debugger sources
+    // Debugger sources (original names, consider namespacing if they become too generic)
     DebuggerNpmStdout,
     DebuggerNpmStderr,
     DebuggerGeneral,
 
-    // Watcher general sources
+    // Watcher general sources - These might be deprecated by ScriptRunner ones
     WatcherEslint,
     WatcherPrettier,
+
+    // ScriptRunner sources
+    ScriptRunnerEslint,
+    ScriptRunnerPrettier,
 
     // Watcher LSP Client sources
     WatcherLspClientRequest,
     WatcherLspClientResponse,
-    WatcherLspClientNotification, // Server-initiated notifications received by client
-    WatcherLspClientError,        // Errors specific to client logic/communication
-    WatcherLspClientLifecycle,    // e.g. initialize, shutdown
+    WatcherLspClientNotification, 
+    WatcherLspClientError,        
+    WatcherLspClientLifecycle,    
 
-    // Watcher LSP Server I/O (raw output from the LSP process)
+    // Watcher LSP Server I/O
     WatcherLspServerStdout,
     WatcherLspServerStderr,
-    WatcherLspServerLifecycle, // e.g. spawn, exit
+    WatcherLspServerLifecycle, 
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -50,7 +54,7 @@ impl From<tracing::Level> for LogLevel {
         } else if level == tracing::Level::TRACE {
             LogLevel::Trace
         } else {
-            LogLevel::Info // Default
+            LogLevel::Info 
         }
     }
 }
@@ -77,7 +81,6 @@ pub fn add_log_entry(source: LogSource, level: LogLevel, message: String) {
     if let Ok(mut store) = SHARED_LOG_STORE.lock() {
         store.push(entry);
     } else {
-        // Fallback or error logging if lock fails - for now, print to stderr
         eprintln!(
             "CRITICAL: Failed to lock SHARED_LOG_STORE to add log entry: [Source: {:?}, Level: {:?}] {}",
             source, level, message
@@ -92,7 +95,7 @@ pub struct LogFilterOptions {
     pub content_contains: Option<String>,
     pub since_timestamp: Option<SystemTime>,
     pub until_timestamp: Option<SystemTime>,
-    pub max_entries: Option<usize>, // Limits the number of returned entries (most recent if not time-sorted otherwise)
+    pub max_entries: Option<usize>, 
 }
 
 pub fn get_shared_logs(filters: LogFilterOptions) -> Result<Vec<LogEntry>> {
@@ -147,8 +150,6 @@ pub fn get_shared_logs(filters: LogFilterOptions) -> Result<Vec<LogEntry>> {
         .cloned()
         .collect();
 
-    // Sort by timestamp descending to handle max_entries correctly (get latest)
-    // This also ensures a consistent order before truncation if no other sort is applied.
     filtered_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     if let Some(max) = filters.max_entries {
@@ -157,7 +158,6 @@ pub fn get_shared_logs(filters: LogFilterOptions) -> Result<Vec<LogEntry>> {
         }
     }
 
-    // Restore original chronological order (oldest to newest) for the selected slice
     filtered_logs.reverse();
 
     Ok(filtered_logs)

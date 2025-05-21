@@ -1,4 +1,4 @@
-use crate::parser_mod::structs::{CodeContext, CodeEntity};
+use crate::codebase_indexing::parser::entities::{CodeContext, CodeEntity};
 use anyhow::Result;
 use clap::ValueEnum;
 use std::cmp::min;
@@ -270,4 +270,4 @@ fn create_merged_entity(merge_candidates: Vec<CodeEntity>) -> CodeEntity {
         },
         embedding: None,
     }
-}
+} 

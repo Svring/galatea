@@ -1,13 +1,12 @@
 // Declare the main library modules
-pub mod editor;
-pub mod embedder;
-pub mod hoarder;
-pub mod indexer;
-pub mod parser_mod;
-pub mod processing;
-pub mod wanderer;
-pub mod watcher;
-pub mod resolver;
-pub mod debugger;
-pub mod utils;
-pub mod logging;
+pub mod api;
+pub mod codebase_indexing;
+pub mod dev_operation;
+pub mod terminal;
+pub mod file_system;
+pub mod dev_setup;
+pub mod dev_runtime;
+
+// Potentially remove these if they are fully merged into terminal
+// pub mod utils;
+// pub mod node_utils;

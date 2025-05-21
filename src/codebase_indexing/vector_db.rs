@@ -1,4 +1,4 @@
-use crate::parser_mod::structs::CodeEntity;
+use crate::codebase_indexing::parser::entities::CodeEntity;
 use anyhow::{Context, Result};
 use async_openai::{
     config::OpenAIConfig, types::CreateEmbeddingRequestArgs, Client as OpenAIClient,
@@ -221,4 +221,4 @@ pub async fn query(
     }
 
     Ok(entities) // Return the collected entities
-}
+} 

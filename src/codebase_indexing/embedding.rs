@@ -1,4 +1,4 @@
-use crate::parser_mod::structs::CodeEntity;
+use crate::codebase_indexing::parser::entities::CodeEntity;
 use anyhow::{Context, Result};
 use async_openai::{
     config::OpenAIConfig,
@@ -331,4 +331,3 @@ pub async fn generate_embeddings_for_vec(
     info!(target: "galatea::embedder", "Generating embeddings for a vector of CodeEntity objects.");
     generate_embeddings_core(entities, model_name, api_key, api_base).await
 } 
-

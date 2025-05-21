@@ -21,4 +21,4 @@ pub struct CodeEntity {
     pub context: CodeContext,
     #[serde(skip_serializing_if = "Option::is_none")] // Don't write embedding field if it's None
     pub embedding: Option<Vec<f32>>, // Added field for embedding vector
-}
+} 

@@ -3,7 +3,8 @@ use lsp_types::Uri;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::wanderer;
+// Changed from crate::file_system to super::search for relative import within the same module
+use super::search;
 
 // Transplanted from watcher.rs
 pub fn get_project_root() -> Result<PathBuf> {
@@ -30,7 +31,7 @@ pub fn get_project_root() -> Result<PathBuf> {
 ///    - Absolute paths within the project root are used directly.
 ///    - Absolute paths outside the root use the filename joined with the project root.
 ///    - Relative or incomplete paths are joined with the project root.
-/// 3. Falls back to `wanderer` to search for files matching the input suffix.
+/// 3. Falls back to `search::find_file_by_suffix` to search for files matching the input suffix.
 /// The resolved path is canonicalized and verified to exist within the project root.
 pub fn resolve_path(input_path: &str) -> Result<PathBuf> {
     let proj_root = get_project_root()?;
@@ -55,12 +56,12 @@ pub fn resolve_path(input_path: &str) -> Result<PathBuf> {
         Ok(canonical) if canonical.exists() && canonical.starts_with(&proj_root) => {
             return Ok(canonical);
         }
-        _ => { /* fall-through to wanderer fallback */ }
+        _ => { /* fall-through to search fallback */ }
     }
 
-    // Fallback to wanderer using the new centralized function
+    // Fallback to search using the new centralized function
     if let Some(found_path) = 
-        wanderer::find_file_by_suffix(&proj_root, input_path)? 
+        search::find_file_by_suffix(&proj_root, input_path)?
     {
         return Ok(found_path);
     }
@@ -128,7 +129,7 @@ mod tests {
         );
         assert_eq!(result, expected_result);
 
-        // Test 3: Path with filename only, using wanderer fallback
+        // Test 3: Path with filename only, using search fallback
         let input = "app.tsx";
         let result = resolve_path(input)?;
         println!(
@@ -198,4 +199,4 @@ mod tests {
         // Note: No cleanup here to avoid race conditions with parallel tests.
         Ok(())
     }
-}
+} 

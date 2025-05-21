@@ -672,4 +672,4 @@ mod tests {
             _ => panic!("last_op should not have been updated by a no-op replace"),
         }
     }
-}
+} 

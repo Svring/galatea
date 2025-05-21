@@ -1,6 +1,6 @@
-use crate::parser_mod; // Using fully qualified path
-use crate::processing; // Import processing module
-use crate::wanderer;
+use crate::codebase_indexing::parser; // Using fully qualified path
+use crate::codebase_indexing::postprocessor; // Import processing module
+use crate::file_system::search;
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
@@ -26,7 +26,7 @@ pub fn index_directory(
     output_file: &Path,
     max_snippet_size: Option<usize>,
     exclude_dirs: &[&str],
-    granularity: processing::Granularity, // Add granularity parameter
+    granularity: postprocessor::Granularity, // Add granularity parameter
 ) -> Result<()> {
     println!(
         "Starting indexing in '{}' for extensions: {:?} (excluding: {:?}, granularity: {:?})",
@@ -37,7 +37,7 @@ pub fn index_directory(
     );
 
     // 1. Find files, passing exclude_dirs
-    let files_to_parse = wanderer::find_files_by_extensions(start_path, extensions, exclude_dirs)
+    let files_to_parse = search::find_files_by_extensions(start_path, extensions, exclude_dirs)
         .with_context(|| format!("Failed scanning directory '{}'", start_path.display()))?;
 
     if files_to_parse.is_empty() {
@@ -46,7 +46,7 @@ pub fn index_directory(
     }
     println!("Found {} files to process.", files_to_parse.len());
 
-    let mut all_entities: Vec<parser_mod::CodeEntity> = Vec::new();
+    let mut all_entities: Vec<parser::entities::CodeEntity> = Vec::new();
 
     // 2. Parse each file based on its extension
     for file_path in files_to_parse {
@@ -56,15 +56,15 @@ pub fn index_directory(
         let parse_result = match extension {
             Some("rs") => {
                 // Call the function re-exported from parser_mod
-                parser_mod::extract_rust_entities_from_file(&file_path, max_snippet_size)
+                parser::extract_rust_entities_from_file(&file_path, max_snippet_size)
             }
             Some("ts") => {
                 // Call the function re-exported (and renamed) from parser_mod
-                parser_mod::extract_ts_entities(&file_path, false, max_snippet_size)
+                parser::extract_ts_entities(&file_path, false, max_snippet_size)
             }
             Some("tsx") => {
                 // Call the function re-exported (and renamed) from parser_mod
-                parser_mod::extract_ts_entities(&file_path, true, max_snippet_size)
+                parser::extract_ts_entities(&file_path, true, max_snippet_size)
             }
             _ => {
                 println!("  -> Skipping file with unsupported extension.");
@@ -95,7 +95,7 @@ pub fn index_directory(
 
     // 3. Post-process based on granularity (splitting is handled during parsing)
     let final_entities =
-        processing::post_process_entities(all_entities, granularity, max_snippet_size);
+        postprocessor::post_process_entities(all_entities, granularity, max_snippet_size);
 
     println!(
         "Total entities after post-processing: {}",
@@ -120,4 +120,4 @@ pub fn index_directory(
 
     println!("Indexing complete.");
     Ok(())
-}
+} 
