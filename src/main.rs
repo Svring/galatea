@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn}; // For return type of initialize_environment
+use clap::Parser; // Added for command-line argument parsing
+use std::env; // Added for std::env::current_dir
+use std::time::Instant; // Added for timing
 
 // Use modules
 use galatea::api; // New api module
@@ -25,23 +28,48 @@ use poem::{
 use lsp_types::Uri;
 
 // API request/response types are now in api::models
+
+// Define command-line arguments
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Cli {
+    #[clap(long)]
+    api_key: Option<String>,
+}
+
 // Uncommented: Moved from debugger.rs and made private, but still used in main
-async fn initialize_environment() -> Result<PathBuf> {
+async fn initialize_environment(api_key: Option<String>) -> Result<PathBuf> {
     let span = tracing::info_span!(target: "galatea::bootstrap", "initialize_environment");
     let _enter = span.enter();
 
-    tracing::info!(target: "galatea::bootstrap", "Starting project verification and setup...");
-    let project_dir = file_system::get_project_root()
-        .context("Bootstrap: Failed to get project root. Ensure 'project' subdirectory exists next to the executable.")?;
+    tracing::info!(target: "galatea::bootstrap", "Attempting to determine project root...");
+    
+    let project_dir_path = match file_system::get_project_root() {
+        Ok(dir) => {
+            tracing::info!(target: "galatea::bootstrap", path = %dir.display(), "Project root found.");
+            dir
+        }
+        Err(e) => {
+            warn!(
+                target: "galatea::bootstrap",
+                error = %e,
+                "Failed to get project root. Will attempt to initialize in default location './project'."
+            );
+            // Define a default project directory if get_project_root fails
+            let current_dir = env::current_dir()
+                .context("Failed to get current working directory to create default project path.")?;
+            current_dir.join("project")
+        }
+    };
 
-    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir.display(), "Ensuring full development environment setup...");
-    dev_setup::ensure_development_environment(&project_dir)
+    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir_path.display(), "Ensuring full development environment setup...");
+    dev_setup::ensure_development_environment(&project_dir_path, api_key)
         .await
         .context("Bootstrap: Failed to ensure development environment setup (Next.js deps/scripts/config, .codex folder).")?;
-    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir.display(), "Development environment setup ensured.");
+    tracing::info!(target: "galatea::bootstrap", project_dir = %project_dir_path.display(), "Development environment setup ensured.");
 
     tracing::info!(target: "galatea::bootstrap", "Project verification and setup completed successfully.");
-    Ok(project_dir)
+    Ok(project_dir_path)
 }
 
 // New function to encapsulate the Next.js server spawning logic
@@ -129,18 +157,26 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!(target: "galatea::main", "Galatea application starting...");
 
+    let cli = Cli::parse(); // Parse command-line arguments
+
     info!(target: "galatea::main", "Phase 1: Initializing environment...");
-    let project_directory = match initialize_environment().await {
+    
+    let now = Instant::now(); // Start timer
+    let initialize_result = initialize_environment(cli.api_key).await;
+    let elapsed = now.elapsed();
+
+    let project_directory = match initialize_result {
         Ok(dir) => {
-            info!(target: "galatea::main", source_component = "bootstrap", path = %dir.display(), "Project environment verified and set up successfully.");
+            info!(target: "galatea::main", source_component = "bootstrap", path = %dir.display(), duration_ms = elapsed.as_millis(), "Project environment verified and set up successfully.");
             dir
         }
         Err(e) => {
-            error!(target: "galatea::main", source_component = "bootstrap", error = ?e, "Failed to verify and set up project environment. Server will not start.");
+            error!(target: "galatea::main", source_component = "bootstrap", error = ?e, duration_ms = elapsed.as_millis(), "Failed to verify and set up project environment. Server will not start.");
             return Err(e);
         }
     };
-    info!(target: "galatea::main", "Phase 1: Environment initialized successfully.");
+    // The following log is a bit redundant if success is logged above with duration, but kept for consistency if initialize_result itself was not logged.
+    // info!(target: "galatea::main", "Phase 1: Environment initialized successfully."); 
 
     info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)...");
     // Call the new function within tokio::spawn

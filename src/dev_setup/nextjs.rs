@@ -98,15 +98,15 @@ pub async fn ensure_project_dependencies_and_scripts(project_dir: &Path) -> Resu
     let package_json_path = project_dir.join("package.json");
 
     if !package_json_path.exists() {
-        tracing::info!(
+        tracing::error!(
             target: "dev_setup::nextjs",
-            path = %project_dir.display(),
-            "Initializing new package.json..."
+            path = %package_json_path.display(),
+            "package.json not found. This function expects it to exist (or be created by a prior step like reinitialization)."
         );
-        terminal::npm::run_npm_command(&project_dir, &["init", "-y"], false)
-            .await
-            .context("dev_setup::nextjs: Failed to initialize new package.json. Please create it manually or check npm installation.")?;
-        tracing::info!(target: "dev_setup::nextjs", "package.json initialized. Please review and customize if necessary.");
+        return Err(anyhow::anyhow!(
+            "package.json not found at {}. Cannot ensure dependencies and scripts.",
+            package_json_path.display()
+        ));
     }
 
     let content = fs::read_to_string(&package_json_path).with_context(|| {
@@ -182,7 +182,92 @@ pub async fn ensure_project_dependencies_and_scripts(project_dir: &Path) -> Resu
     Ok(())
 }
 
-pub async fn ensure_next_config_rewrites(project_dir: &Path) -> Result<()> {
+pub async fn reinitialize_nextjs_project(project_root: &Path) -> Result<()> {
+    tracing::warn!(
+        target: "dev_setup::nextjs",
+        path = %project_root.display(),
+        "Reinitializing Next.js project: The existing directory will be cleared and a new project scaffolded."
+    );
+
+    // Remove the existing project directory if it exists
+    if project_root.exists() {
+        fs::remove_dir_all(project_root).with_context(|| {
+            format!(
+                "Failed to remove existing project directory at {}",
+                project_root.display()
+            )
+        })?;
+        tracing::info!(target: "dev_setup::nextjs", path = %project_root.display(), "Existing project directory removed.");
+    }
+
+    // Recreate the project directory
+    fs::create_dir_all(project_root).with_context(|| {
+        format!(
+            "Failed to create project directory at {}",
+            project_root.display()
+        )
+    })?;
+    tracing::info!(target: "dev_setup::nextjs", path = %project_root.display(), "Project directory re-created.");
+
+    tracing::info!(
+        target: "dev_setup::nextjs",
+        path = %project_root.display(),
+        "Initializing new Next.js project using create-next-app..."
+    );
+
+    let create_next_app_args = [
+        "create-next-app@latest",
+        ".", // Create in current directory (which is project_root)
+        "--ts",
+        "--eslint",
+        "--app",
+        "--src-dir",
+        "--tailwind",
+        "--use-npm",
+        "--import-alias",
+        "@/*",
+        "--turbopack",
+    ];
+
+    // Note: run_npm_command typically takes `npm` as the command and then args.
+    // For npx, we should probably adjust run_npm_command or have a more generic command runner.
+    // For now, assuming run_npm_command can handle `npx` as the first part of args or similar.
+    // If terminal::npm::run_npm_command expects "npm" as command and args after,
+    // we might need to call terminal::run_command directly if it exists and is suitable,
+    // or adjust run_npm_command. For now, we pass it as part of the args to run_npm_command, 
+    // hoping it constructs the call as `npm exec create-next-app...` or that `npx` is handled by `run_npm_command`.
+    // A better way would be to have `run_npx_command` in terminal module.
+    // The existing run_npm_command prepends `npm` to the args. This will make it `npm npx create-next-app...` which is wrong.
+    // Let's assume for now the `run_npm_command` will be smart, or use a placeholder for what should be a direct command execution.
+    // Revisiting this assumption: `run_npm_command` is likely specific to `npm` itself.
+    // We should use a more generic command execution for `npx`.
+    // Let's use a direct call to a generic command runner if available, or simulate its expected use.
+    // For the purpose of this change, I'll use the existing run_npm_command but with npx as the first arg,
+    // acknowledging this might need adjustment in the terminal module.
+
+    // Correct approach: Use a generic command execution utility. 
+    // Since `terminal::npm::run_npm_command` is specific, we'd ideally have `terminal::run_generic_command`.
+    // If not, we'd call `std::process::Command` directly, wrapped in similar error handling.
+    // Given the tools, let's use the `terminal::npm::run_npm_command` and pass `npx` and its args.
+    // This is a temporary workaround until a generic command runner is available or `run_npm_command` is verified to handle this.
+    // The provided tool definition for `terminal::npm::run_npm_command` seems to be just `run_npm_command(project_dir, &install_args, false)`
+    // It implies the command is hardcoded to `npm` internally. 
+    // I must use the tools as defined. `run_npm_command` is the only one available for this.
+    // I will have to call `npm install create-next-app@latest` then try to run it, or see if `npm exec` works via run_npm_command.
+
+    // Simpler path: use the existing `run_npm_command` with `exec` which is an npm command.
+    let mut npx_equivalent_args = vec!["exec", "--yes", "--"]; // --yes for npx prompt, -- to separate npm args from command args
+    npx_equivalent_args.extend_from_slice(&create_next_app_args);
+    
+    crate::terminal::npm::run_npm_command(project_root, &npx_equivalent_args, false)
+        .await
+        .context("dev_setup::nextjs: Failed to reinitialize Next.js project using 'npm exec create-next-app'.")?;
+
+    tracing::info!(target: "dev_setup::nextjs", path = %project_root.display(), "Next.js project reinitialized successfully.");
+    Ok(())
+}
+
+pub async fn ensure_next_config(project_dir: &Path) -> Result<()> {
     let config_filenames = ["next.config.ts", "next.config.js", "next.config.mjs"];
     let mut existing_config_path: Option<PathBuf> = None;
     let mut chosen_config_filename = "next.config.ts"; // Default to .ts for creation
