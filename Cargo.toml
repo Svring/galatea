@@ -10,6 +10,7 @@ backoff = {version = "0.4", features = ["tokio"]}
 chrono = "0.4"
 clap = {version = "4.5.37", features = ["derive"]}
 console_error_panic_hook = "0.1.7"
+dashmap = "6.1.0"
 dunce = "1.0.5"
 fluent-uri = "0.3.2"
 futures = "0.3"

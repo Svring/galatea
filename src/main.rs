@@ -4,8 +4,11 @@ use std::env; // Added for std::env::current_dir
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use std::time::Duration; // Added for http_request_timeout
 use tokio::sync::Mutex;
+use tokio::time::sleep as tokio_sleep; // Alias to avoid conflict if Duration::sleep is used
 use tracing::{error, info, warn}; // For return type of initialize_environment // Added for timing
+use dashmap::DashMap; // For codex task state
 
 // Use modules
 use galatea::api; // New api module
@@ -145,10 +148,25 @@ async fn launch_api_server(host: &str, port: u16) -> Result<()> {
 
     info!(target: "galatea::main", source_component = "server_startup", host, port, "Starting Galatea server");
     info!(target: "galatea::main", source_component = "server_startup", "Serving API at /api and static files from ./dist at / ");
+
+    // Codex task state
+    let codex_tasks_state = Arc::new(DashMap::<String, api::routes::codex_api::CodexTaskStatus>::new());
+
+    // Spawn background task for cleaning up old codex tasks
+    let codex_tasks_state_for_cleanup = Arc::clone(&codex_tasks_state);
+    tokio::spawn(async move {
+        let cleanup_interval = Duration::from_secs(60 * 10); // e.g., every 10 minutes
+        loop {
+            tokio_sleep(cleanup_interval).await;
+            info!(target: "galatea::main", "Running cleanup for old codex tasks...");
+            api::routes::codex_api::cleanup_old_tasks(&codex_tasks_state_for_cleanup);
+        }
+    });
+
     Server::new(TcpListener::bind(format!("{}:{}", host, port)))
-        // Pass necessary states. Editor state might only be needed by editor_api routes.
-        // LspClient state is needed by lsp_api routes.
-        .run(app.data(editor_state).data(lsp_client_state))
+        .idle_timeout(Duration::from_secs(300)) // Set idle timeout to 300 seconds
+        // Pass necessary states.
+        .run(app.data(editor_state).data(lsp_client_state).data(codex_tasks_state))
         .await
         .map_err(|e| anyhow::anyhow!("Server error: {}", e))
 }
