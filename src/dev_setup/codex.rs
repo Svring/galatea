@@ -4,7 +4,16 @@ use std::path::Path;
 use tracing;
 use crate::terminal;
 
+const NODE_VERSION: &str = "22";
+
 pub async fn ensure_codex_cli_installed(project_root_for_context: &Path) -> Result<()> {
+    tracing::info!(target: "dev_setup::codex", "Setting up Node.js environment for codex...");
+    
+    // First ensure we're using Node.js 22
+    terminal::nvm::ensure_node_version(project_root_for_context, NODE_VERSION)
+        .await
+        .context(format!("Failed to set up Node.js version {} for codex", NODE_VERSION))?;
+    
     tracing::info!(target: "dev_setup::codex", "Ensuring @openai/codex CLI is installed globally...");
 
     let install_args = ["install", "-g", "@openai/codex"];

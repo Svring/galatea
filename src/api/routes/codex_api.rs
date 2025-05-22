@@ -1,24 +1,20 @@
 use poem::{
-    error::{InternalServerError, NotFoundError},
+    error::NotFoundError,
     handler,
     http::StatusCode,
     post,
     get,
     web::{Data, Json, Path},
     IntoResponse,
-    Response,
     Result,
     Route,
 };
 use serde::{Deserialize, Serialize};
 // use serde_json::Value; // Removed: No longer needed for raw output
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 use dashmap::DashMap;
 
@@ -55,22 +51,31 @@ pub enum CodexTaskStatus {
     Failed { query_text: String, error: String, #[serde(skip)] last_updated: Instant },
 }
 
+impl CodexTaskStatus {
+    pub fn last_updated(&self) -> &Instant {
+        match self {
+            CodexTaskStatus::Pending { last_updated, .. } => last_updated,
+            CodexTaskStatus::Processing { last_updated, .. } => last_updated,
+            CodexTaskStatus::Completed { last_updated, .. } => last_updated,
+            CodexTaskStatus::Failed { last_updated, .. } => last_updated,
+        }
+    }
+
+    pub fn query_text(&self) -> &str {
+        match self {
+            CodexTaskStatus::Pending { query_text, .. } => query_text,
+            CodexTaskStatus::Processing { query_text, .. } => query_text,
+            CodexTaskStatus::Completed { query_text, .. } => query_text,
+            CodexTaskStatus::Failed { query_text, .. } => query_text,
+        }
+    }
+}
+
 #[derive(Serialize, Debug)]
 struct CodexStatusResponse {
     task_id: String,
     task_status: CodexTaskStatus,
 }
-
-#[derive(Debug)]
-struct SimpleError(String);
-
-impl std::fmt::Display for SimpleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SimpleError {}
 
 // Removed try_pretty_print_json_string helper function as it's no longer needed.
 
@@ -89,19 +94,22 @@ async fn run_codex_command_logic(query_text: String) -> Result<CodexApiResponse,
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut process = cmd.spawn().map_err(|e| {
-        let err_msg = format!("Failed to start codex process: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
-    })?;
+    let mut process = match cmd.spawn() {
+        Ok(p) => p,
+        Err(e) => {
+            let err_msg = format!("Failed to start codex process: {}", e);
+            eprintln!("{}", err_msg);
+            return Err(err_msg);
+        }
+    };
 
     let mut stdout_str = String::new();
     if let Some(mut stdout) = process.stdout.take() {
-        stdout.read_to_string(&mut stdout_str).await.map_err(|e| {
+        if let Err(e) = stdout.read_to_string(&mut stdout_str).await {
             let err_msg = format!("Failed to read codex stdout: {}", e);
             eprintln!("{}", err_msg);
-            err_msg
-        })?;
+            return Err(err_msg);
+        }
     } else {
         let err_msg = "Failed to capture codex stdout".to_string();
         eprintln!("{}", err_msg);
@@ -112,14 +120,18 @@ async fn run_codex_command_logic(query_text: String) -> Result<CodexApiResponse,
     if let Some(mut stderr) = process.stderr.take() {
         if let Err(e) = stderr.read_to_string(&mut stderr_str).await {
             eprintln!("Failed to read codex stderr: {}", e);
+            // Continue execution as stderr is not critical
         }
     }
 
-    let status = process.wait().await.map_err(|e| {
-        let err_msg = format!("Failed to wait for codex process: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
-    })?;
+    let status = match process.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            let err_msg = format!("Failed to wait for codex process: {}", e);
+            eprintln!("{}", err_msg);
+            return Err(err_msg);
+        }
+    };
 
     if !status.success() && !stderr_str.is_empty() {
         let err_msg = format!("Codex process error: {}", stderr_str);
@@ -131,19 +143,16 @@ async fn run_codex_command_logic(query_text: String) -> Result<CodexApiResponse,
         println!("Codex stderr (non-fatal for task, but logged): {}", stderr_str);
     }
 
-    if !stdout_str.is_empty() {
-        Ok(CodexApiResponse {
-            raw_codex_output: Some(stdout_str),
-            ..Default::default()
-        })
-    } else {
-        let err_msg = format!(
-            "Codex command for query \"{}\" produced no stdout. Process success: {}. Stderr: '{}'",
-            query_text, status.success(), stderr_str
-        );
-        eprintln!("{}", err_msg);
-        Err(err_msg)
-    }
+    // Always return a response, even if stdout is empty
+    // This prevents client errors when polling for status
+    Ok(CodexApiResponse {
+        raw_codex_output: Some(if stdout_str.is_empty() {
+            "Command executed successfully but produced no output.".to_string()
+        } else {
+            stdout_str
+        }),
+        ..Default::default()
+    })
 }
 
 #[handler]
@@ -164,16 +173,33 @@ async fn submit_codex_task_handler(
     tokio::spawn(async move {
         let task_start_time = Instant::now();
         println!("Task {} (query: \"{}\") processing started...", task_id_clone, query_text_clone_for_task);
-        tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Processing { query_text: query_text_clone_for_task.clone(), last_updated: Instant::now() });
+        
+        // Update task status to Processing
+        tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Processing { 
+            query_text: query_text_clone_for_task.clone(), 
+            last_updated: Instant::now() 
+        });
 
         match run_codex_command_logic(query_text_clone_for_task.clone()).await {
             Ok(response) => {
-                tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Completed { query_text: query_text_clone_for_task.clone(), response, last_updated: Instant::now() });
+                // Update task status to Completed with the current timestamp
+                tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Completed { 
+                    query_text: query_text_clone_for_task.clone(), 
+                    response, 
+                    last_updated: Instant::now() 
+                });
+                
                 let duration_ms = task_start_time.elapsed().as_secs_f64() * 1000.0;
                 println!("Task {} (query: \"{}\") completed successfully in {:.2}ms.", task_id_clone, query_text_clone_for_task, duration_ms);
             }
             Err(error_message) => {
-                tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Failed { query_text: query_text_clone_for_task.clone(), error: error_message.clone(), last_updated: Instant::now() });
+                // Update task status to Failed with the current timestamp
+                tasks_clone.insert(task_id_clone.clone(), CodexTaskStatus::Failed { 
+                    query_text: query_text_clone_for_task.clone(), 
+                    error: error_message.clone(), 
+                    last_updated: Instant::now() 
+                });
+                
                 let duration_ms = task_start_time.elapsed().as_secs_f64() * 1000.0;
                 eprintln!("Task {} (query: \"{}\") failed after {:.2}ms: {}", task_id_clone, query_text_clone_for_task, duration_ms, error_message);
             }
@@ -197,10 +223,9 @@ async fn get_codex_task_status_handler(
                 task_status: task_status_cloned.clone(),
             });
 
-            match task_status_cloned {
+            match task_ref.value() {
                 CodexTaskStatus::Completed { .. } | CodexTaskStatus::Failed { .. } => {
-                    tasks.remove(&task_id);
-                    println!("Task {} removed after query (status was Completed/Failed).", task_id);
+                    println!("Task {} queried with Completed/Failed status, will be removed by cleanup process.", task_id);
                 }
                 _ => {}
             }
@@ -218,7 +243,8 @@ pub fn codex_routes() -> Route {
 
 // --- Memory Management Utilities ---
 
-const TASK_MAX_LIFETIME_SECONDS: u64 = 3600; // 1 hour
+const TASK_MAX_LIFETIME_SECONDS: u64 = 3600; // 1 hour for pending/processing tasks
+const COMPLETED_TASK_LIFETIME_SECONDS: u64 = 300; // 5 minutes for completed/failed tasks
 
 // This function can be called by a background task in main.rs
 pub fn cleanup_old_tasks(tasks: &Arc<DashMap<String, CodexTaskStatus>>) {
@@ -229,15 +255,13 @@ pub fn cleanup_old_tasks(tasks: &Arc<DashMap<String, CodexTaskStatus>>) {
     for entry in tasks.iter() {
         let task_id = entry.key();
         let status = entry.value();
-
-        let task_last_updated = match status {
-            CodexTaskStatus::Pending { last_updated, .. } => last_updated,
-            CodexTaskStatus::Processing { last_updated, .. } => last_updated,
-            CodexTaskStatus::Completed { last_updated, .. } => last_updated,
-            CodexTaskStatus::Failed { last_updated, .. } => last_updated,
+        
+        let max_lifetime = match status {
+            CodexTaskStatus::Completed { .. } | CodexTaskStatus::Failed { .. } => COMPLETED_TASK_LIFETIME_SECONDS,
+            _ => TASK_MAX_LIFETIME_SECONDS,
         };
 
-        if now.duration_since(*task_last_updated).as_secs() > TASK_MAX_LIFETIME_SECONDS {
+        if now.duration_since(*status.last_updated()).as_secs() > max_lifetime {
             tasks_to_remove.push(task_id.clone());
         }
     }
@@ -245,7 +269,7 @@ pub fn cleanup_old_tasks(tasks: &Arc<DashMap<String, CodexTaskStatus>>) {
     // Remove the identified tasks
     for task_id in tasks_to_remove {
         if tasks.remove(&task_id).is_some() {
-            println!("Task {} removed by TTL cleanup (older than 1 hour).", task_id);
+            println!("Task {} removed by TTL cleanup.", task_id);
         }
     }
 }
