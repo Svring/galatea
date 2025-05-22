@@ -86,9 +86,11 @@ async fn run_codex_command_logic(query_text: String) -> Result<CodexApiResponse,
         err_msg
     })?;
 
-    let mut cmd = Command::new("codex");
-    cmd.arg("-q");
-    cmd.arg(&query_text);
+    // Use bash with nvm to ensure we're running with Node.js 22
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg("source ~/.nvm/nvm.sh && nvm use 22 > /dev/null && codex -q \"$CODEX_QUERY\"");
+    cmd.env("CODEX_QUERY", &query_text);  // Pass the query as an environment variable to avoid shell escaping issues
     cmd.current_dir(&project_root_path);
 
     cmd.stdout(std::process::Stdio::piped());

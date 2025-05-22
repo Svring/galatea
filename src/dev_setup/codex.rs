@@ -3,8 +3,49 @@ use std::fs;
 use std::path::Path;
 use tracing;
 use crate::terminal;
+use tokio::process::Command;
+use std::process::Stdio;
 
 const NODE_VERSION: &str = "22";
+
+async fn verify_node_version(project_root: &Path) -> Result<bool> {
+    // Run a command to check the current node version
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg("node --version");
+    cmd.current_dir(project_root);
+    cmd.stdout(Stdio::piped());
+    
+    let output = cmd.output().await.context("Failed to execute node --version command")?;
+    
+    if !output.status.success() {
+        tracing::warn!(target: "dev_setup::codex", "Failed to check node version");
+        return Ok(false);
+    }
+    
+    let version_str = String::from_utf8_lossy(&output.stdout);
+    let version_str = version_str.trim();
+    
+    // Check if version starts with v22
+    let is_correct_version = version_str.starts_with("v22");
+    
+    if !is_correct_version {
+        tracing::warn!(
+            target: "dev_setup::codex", 
+            current_version = %version_str, 
+            expected_version = %NODE_VERSION,
+            "Node.js version mismatch"
+        );
+    } else {
+        tracing::info!(
+            target: "dev_setup::codex", 
+            version = %version_str,
+            "Verified Node.js version"
+        );
+    }
+    
+    Ok(is_correct_version)
+}
 
 pub async fn ensure_codex_cli_installed(project_root_for_context: &Path) -> Result<()> {
     tracing::info!(target: "dev_setup::codex", "Setting up Node.js environment for codex...");
@@ -14,13 +55,44 @@ pub async fn ensure_codex_cli_installed(project_root_for_context: &Path) -> Resu
         .await
         .context(format!("Failed to set up Node.js version {} for codex", NODE_VERSION))?;
     
+    // Verify that the node version is actually set correctly
+    let version_verified = verify_node_version(project_root_for_context).await
+        .context("Failed to verify Node.js version")?;
+    
+    if !version_verified {
+        tracing::warn!(
+            target: "dev_setup::codex",
+            "Node.js version verification failed. This may cause issues with codex. Will proceed with installation anyway."
+        );
+    }
+    
     tracing::info!(target: "dev_setup::codex", "Ensuring @openai/codex CLI is installed globally...");
 
-    let install_args = ["install", "-g", "@openai/codex"];
-
-    terminal::npm::run_npm_command(project_root_for_context, &install_args, false)
-        .await
-        .context("Failed to install @openai/codex CLI globally. Please check npm and network connectivity.")?;
+    // Use the bash command with nvm to ensure Node.js 22 is used for npm install
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg("source ~/.nvm/nvm.sh && nvm use 22 && npm install -g @openai/codex");
+    cmd.current_dir(project_root_for_context);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let output = cmd.output().await.context("Failed to execute npm install command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(target: "dev_setup::codex", stderr = %stderr, "Failed to install @openai/codex CLI");
+        return Err(anyhow::anyhow!("Failed to install @openai/codex CLI: {}", stderr));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        tracing::info!(target: "dev_setup::codex::npm::stdout", "{}", stdout.trim_end());
+    }
+    
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        tracing::warn!(target: "dev_setup::codex::npm::stderr", "{}", stderr.trim_end());
+    }
 
     tracing::info!(target: "dev_setup::codex", "@openai/codex CLI global installation command executed. (If it wasn't already installed, it should be now).");
     Ok(())
