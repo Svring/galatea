@@ -82,7 +82,8 @@ pub struct BuildIndexRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EditorCommandRequest {
     pub command: String,
-    pub path: String,
+    pub path: Option<String>,
+    pub paths: Option<Vec<String>>,
     pub file_text: Option<String>,
     pub insert_line: Option<usize>,
     pub new_str: Option<String>,
@@ -90,19 +91,35 @@ pub struct EditorCommandRequest {
     pub view_range: Option<Vec<isize>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EditorFileViewResponse {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<usize>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EditorCommandResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub line_count: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_content: Option<Vec<EditorFileViewResponse>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

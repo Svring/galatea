@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::api::models::EditorFileViewResponse; // Import for multi-view response
 
 // Enum to represent the type of the last operation for undo functionality
 #[derive(Debug)]
@@ -56,7 +57,8 @@ pub enum CommandType {
 #[derive(Debug, Clone)]
 pub struct EditorArgs {
     pub command: CommandType,
-    pub path: String,
+    pub path: Option<String>, // For single path operations, or single view
+    pub paths: Option<Vec<String>>, // For multi-path view
     pub file_text: Option<String>,      // For Create
     pub insert_line: Option<usize>,     // For Insert (1-indexed)
     pub new_str: Option<String>,        // For StrReplace (optional), Insert (required)
@@ -64,25 +66,60 @@ pub struct EditorArgs {
     pub view_range: Option<Vec<isize>>, // For View (e.g., [1, 10] or [5, -1])
 }
 
-pub fn handle_command(editor: &mut Editor, args: EditorArgs) -> Result<Option<String>, String> {
-    let path = PathBuf::from(&args.path);
+// Output structure for multi-file view operations within the editor module
+#[derive(Debug, Clone)]
+pub struct MultiFileViewOutput {
+    pub path: String,
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub line_count: Option<usize>,
+}
 
+// Updated to return a more structured response for multi-view
+#[derive(Debug, Clone)]
+pub enum EditorOperationResult {
+    Single(Option<String>), // For non-view ops, or single file view content
+    Multi(Vec<MultiFileViewOutput>), // For multi-file view
+}
+
+pub fn handle_command(editor: &mut Editor, args: EditorArgs) -> Result<EditorOperationResult, String> {
     match args.command {
-        CommandType::View => view_file(&path, args.view_range),
+        CommandType::View => {
+            if let Some(target_paths) = args.paths {
+                if args.path.is_some() {
+                    return Err("Error: For 'view' command, provide either 'path' for a single file or 'paths' for multiple, not both.".to_string());
+                }
+                if target_paths.is_empty(){
+                    return Err("Error: For 'view' command with 'paths', the list cannot be empty.".to_string());
+                }
+                view_multiple_files(&target_paths, args.view_range).map(EditorOperationResult::Multi)
+            } else if let Some(target_path_str) = args.path {
+                let path_buf = PathBuf::from(&target_path_str);
+                view_file(&path_buf, args.view_range).map(EditorOperationResult::Single)
+            } else {
+                Err("Error: 'path' or 'paths' is required for 'view' command.".to_string())
+            }
+        }
         CommandType::Create => {
+            let target_path_str = args.path.ok_or_else(|| "Error: 'path' is required for 'create' command.".to_string())?;
+            let path_buf = PathBuf::from(&target_path_str);
             let content = args.file_text.ok_or_else(|| {
                 "Error: 'file_text' is required for 'create' command.".to_string()
             })?;
-            create_file(editor, &path, &content)
+            create_file(editor, &path_buf, &content).map(EditorOperationResult::Single)
         }
         CommandType::StrReplace => {
+            let target_path_str = args.path.ok_or_else(|| "Error: 'path' is required for 'str_replace' command.".to_string())?;
+            let path_buf = PathBuf::from(&target_path_str);
             let old_s = args.old_str.ok_or_else(|| {
                 "Error: 'old_str' is required for 'str_replace' command.".to_string()
             })?;
             let new_s = args.new_str.unwrap_or_default();
-            str_replace_in_file(editor, &path, &old_s, &new_s)
+            str_replace_in_file(editor, &path_buf, &old_s, &new_s).map(EditorOperationResult::Single)
         }
         CommandType::Insert => {
+            let target_path_str = args.path.ok_or_else(|| "Error: 'path' is required for 'insert' command.".to_string())?;
+            let path_buf = PathBuf::from(&target_path_str);
             let line_num_1_indexed = args.insert_line.ok_or_else(|| {
                 "Error: 'insert_line' is required for 'insert' command.".to_string()
             })?;
@@ -92,13 +129,13 @@ pub fn handle_command(editor: &mut Editor, args: EditorArgs) -> Result<Option<St
             let new_s = args
                 .new_str
                 .ok_or_else(|| "Error: 'new_str' is required for 'insert' command.".to_string())?;
-            insert_into_file(editor, &path, line_num_1_indexed - 1, &new_s)
+            insert_into_file(editor, &path_buf, line_num_1_indexed - 1, &new_s).map(EditorOperationResult::Single)
         }
-        CommandType::UndoEdit => undo_last_edit(editor),
+        CommandType::UndoEdit => undo_last_edit(editor).map(EditorOperationResult::Single),
     }
 }
 
-fn view_file(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<String>, String> {
+fn view_file_core(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<String>, String> {
     if !path.exists() {
         return Err(format!("Error: File not found at '{}'", path.display()));
     }
@@ -125,24 +162,20 @@ fn view_file(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<Strin
             }
 
             if total_lines == 0 {
-                // Empty file
                 if start_line == 1 && (end_line == -1 || end_line >= 1) {
-                    return Ok(Some("".to_string())); // e.g. [1,1] or [1,-1] on empty file
+                    return Ok(Some("".to_string()));
                 } else if start_line == 1 && end_line < 1 && end_line != -1 {
-                    // e.g. [1,0]
                     return Err(format!(
                         "Error: End line {} is invalid for start line {} on an empty file.",
                         end_line, start_line
                     ));
                 }
-                // start_line > 1 on empty file, or invalid end_line for start_line 1
                 return Err(format!(
                     "Error: Start line {} is beyond the end of an empty file or range is invalid.",
                     start_line
                 ));
             }
 
-            // File has content
             if start_line > total_lines {
                 return Err(format!(
                     "Error: Start line {} is beyond the end of file ({} lines).",
@@ -161,13 +194,11 @@ fn view_file(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<Strin
                 ));
             }
 
-            // Cap end_line if it exceeds total_lines (and wasn't originally -1)
             if range[1] != -1 && end_line > total_lines {
                 end_line = total_lines;
             }
 
             let start_0_idx = (start_line - 1) as usize;
-            // end_line is 1-indexed inclusive. For count: end_line - start_line + 1
             let count = (end_line - start_line + 1).max(0) as usize;
 
             let selected_lines: Vec<&str> = lines
@@ -181,6 +212,46 @@ fn view_file(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<Strin
         }
         None => Ok(Some(file_content)),
     }
+}
+
+// Wrapper for view_file_core to match expected signature in handle_command for single file views
+fn view_file(path: &Path, view_range: Option<Vec<isize>>) -> Result<Option<String>, String> {
+    view_file_core(path, view_range)
+}
+
+fn view_multiple_files(paths: &[String], view_range: Option<Vec<isize>>) -> Result<Vec<MultiFileViewOutput>, String> {
+    let mut results = Vec::new();
+    for path_str in paths {
+        let path_buf = PathBuf::from(path_str);
+        match view_file_core(&path_buf, view_range.clone()) { // Use core logic
+            Ok(Some(content)) => {
+                let line_count = Some(content.lines().count());
+                results.push(MultiFileViewOutput {
+                    path: path_str.clone(),
+                    content: Some(content),
+                    error: None,
+                    line_count,
+                });
+            }
+            Ok(None) => { // Should not happen if view_file_core guarantees Some on Ok
+                results.push(MultiFileViewOutput {
+                    path: path_str.clone(),
+                    content: None, 
+                    error: Some("Internal error: view_file_core returned Ok(None)".to_string()),
+                    line_count: None,
+                });
+            }
+            Err(e) => {
+                results.push(MultiFileViewOutput {
+                    path: path_str.clone(),
+                    content: None,
+                    error: Some(e),
+                    line_count: None,
+                });
+            }
+        }
+    }
+    Ok(results)
 }
 
 fn create_file(editor: &mut Editor, path: &Path, content: &str) -> Result<Option<String>, String> {
@@ -206,7 +277,7 @@ fn create_file(editor: &mut Editor, path: &Path, content: &str) -> Result<Option
         .map_err(|e| format!("Error writing file '{}': {}", path.display(), e))?;
 
     editor.record_write_op(path, original_content);
-    Ok(None)
+    Ok(None) // Create operation itself doesn't return content
 }
 
 fn str_replace_in_file(
@@ -239,7 +310,7 @@ fn str_replace_in_file(
         editor.record_write_op(path, Some(original_content_bytes));
     }
 
-    Ok(None)
+    Ok(None) // StrReplace operation itself doesn't return content
 }
 
 fn insert_into_file(
@@ -266,8 +337,6 @@ fn insert_into_file(
     let mut lines: Vec<String> = original_content_str.lines().map(String::from).collect();
 
     if insert_line_0_indexed > lines.len() {
-        // e.g. 3 lines (len=3, idx 0,1,2). insert_0_idx=3 (after line 3 / at line 4). This is an append.
-        // If insert_0_idx=4, then 4 > 3 is true -> Error.
         return Err(format!(
             "Error: 'insert_line' {} (0-indexed: {}) is out of bounds for file with {} lines. Cannot insert after a non-existent line.",
             insert_line_0_indexed + 1, insert_line_0_indexed, lines.len()
@@ -275,18 +344,14 @@ fn insert_into_file(
     }
 
     if lines.is_empty() && insert_line_0_indexed == 0 {
-        // Inserting into an empty file at (1-indexed) line 1
         lines.push(text_to_insert.to_string());
     } else if insert_line_0_indexed == lines.len() {
-        // Append: insert_line (1-idx) is 1 greater than total lines
         lines.push(text_to_insert.to_string());
     } else {
-        // Insert in the middle: insert_line_0_indexed < lines.len()
         lines.insert(insert_line_0_indexed + 1, text_to_insert.to_string());
     }
 
     let mut modified_content = lines.join("\n");
-    // Handle trailing newline consistency: if original had one (and wasn't empty), and new one doesn't, add it.
     if !original_content_str.is_empty()
         && original_content_str.ends_with('\n')
         && !lines.is_empty()
@@ -294,16 +359,14 @@ fn insert_into_file(
     {
         modified_content.push('\n');
     }
-    // If original was empty, or didn't end with newline, and new content (from single line insert) doesn't have one, it's fine.
 
     if modified_content != original_content_str {
-        // Compare with string representation, not bytes, due to potential newline char differences
         fs::write(path, &modified_content)
             .map_err(|e| format!("Error writing to file '{}': {}", path.display(), e))?;
         editor.record_write_op(path, Some(original_content_bytes));
     }
 
-    Ok(None)
+    Ok(None) // Insert operation itself doesn't return content
 }
 
 fn undo_last_edit(editor: &mut Editor) -> Result<Option<String>, String> {
@@ -319,7 +382,6 @@ fn undo_last_edit(editor: &mut Editor) -> Result<Option<String>, String> {
                     )
                 })?;
             }
-            // If not exists or not a file, consider undo successful as the state (no file) is achieved.
             Ok(None)
         }
         LastOperation::Overwrite {
@@ -327,7 +389,6 @@ fn undo_last_edit(editor: &mut Editor) -> Result<Option<String>, String> {
             original_content,
         } => {
             if path.is_dir() {
-                // editor.last_op is already None, must restore it if op fails early
                 editor.last_op = LastOperation::Overwrite {
                     path: path.clone(),
                     original_content,
@@ -338,8 +399,6 @@ fn undo_last_edit(editor: &mut Editor) -> Result<Option<String>, String> {
                 ));
             }
             fs::write(&path, original_content).map_err(|e| {
-                // Attempt to restore last_op if write fails. This is tricky.
-                // For simplicity here, we assume if write fails, the state is uncertain for another undo.
                 format!(
                     "Error undoing overwrite (writing original content to '{}'): {}",
                     path.display(),
@@ -360,7 +419,8 @@ mod tests {
     fn make_args_struct(command: CommandType, path_str: &str) -> EditorArgs {
         EditorArgs {
             command,
-            path: path_str.to_string(),
+            path: Some(path_str.to_string()),
+            paths: None,
             file_text: None,
             insert_line: None,
             new_str: None,
@@ -387,8 +447,12 @@ mod tests {
 
         // View
         let view_args = make_args_struct(CommandType::View, file_path_str);
-        let content = handle_command(&mut editor, view_args).unwrap().unwrap();
-        assert_eq!(content, "Hello\nWorld");
+        match handle_command(&mut editor, view_args).unwrap() {
+            EditorOperationResult::Single(Some(content)) => {
+                assert_eq!(content, "Hello\nWorld");
+            }
+            _ => panic!("Expected Single(Some(content)) for view result"),
+        }
 
         // Undo Create
         let undo_args = make_args_struct(CommandType::UndoEdit, file_path_str); // Path in args not used by undo
@@ -491,16 +555,16 @@ mod tests {
         // Test cases
         let test_cases = vec![
             // range, expected_output (Ok value or Err part of message)
-            (Some(vec![2, 4]), Ok("L2\nL3\nL4")),  // Lines 2,3,4
-            (Some(vec![3, -1]), Ok("L3\nL4\nL5")), // Lines 3 to end
-            (Some(vec![1, 1]), Ok("L1")),          // Line 1 only
-            (Some(vec![5, 5]), Ok("L5")),          // Last line only
-            (Some(vec![1, 5]), Ok("L1\nL2\nL3\nL4\nL5")), // All lines
-            (Some(vec![4, 10]), Ok("L4\nL5")),     // Range exceeding end, capped
+            (Some(vec![2, 4]), Ok("L2\nL3\nL4")),
+            (Some(vec![3, -1]), Ok("L3\nL4\nL5")),
+            (Some(vec![1, 1]), Ok("L1")),
+            (Some(vec![5, 5]), Ok("L5")),
+            (Some(vec![1, 5]), Ok("L1\nL2\nL3\nL4\nL5")),
+            (Some(vec![4, 10]), Ok("L4\nL5")),
             (
                 Some(vec![6, 7]),
                 Err("Start line 6 is beyond the end of file (5 lines)"),
-            ), // Start out of bounds
+            ),
             (
                 Some(vec![0, 2]),
                 Err("Start line in 'view_range' must be positive"),
@@ -524,12 +588,12 @@ mod tests {
             args.view_range = range.clone();
             let result = handle_command(&mut editor, args);
             match expected {
-                Ok(exp_str) => assert_eq!(
-                    result.unwrap().unwrap(),
-                    exp_str,
-                    "Mismatch for range {:?}",
-                    range
-                ),
+                Ok(exp_str) => match result.unwrap() {
+                    EditorOperationResult::Single(Some(content)) => {
+                        assert_eq!(content, exp_str, "Mismatch for range {:?}", range);
+                    }
+                    _ => panic!("Expected Single(Some(content)) for successful view range test, range {:?}", range),
+                },
                 Err(err_msg_part) => {
                     let err = result.unwrap_err();
                     assert!(
@@ -550,20 +614,16 @@ mod tests {
 
         let mut args_empty = make_args_struct(CommandType::View, empty_path_str);
         args_empty.view_range = Some(vec![1, 1]);
-        assert_eq!(
-            handle_command(&mut editor, args_empty.clone())
-                .unwrap()
-                .unwrap(),
-            ""
-        );
+        match handle_command(&mut editor, args_empty.clone()).unwrap() {
+            EditorOperationResult::Single(Some(content)) => assert_eq!(content, ""),
+            _ => panic!("Expected empty content for view [1,1] on empty file"),
+        }
 
         args_empty.view_range = Some(vec![1, -1]);
-        assert_eq!(
-            handle_command(&mut editor, args_empty.clone())
-                .unwrap()
-                .unwrap(),
-            ""
-        );
+        match handle_command(&mut editor, args_empty.clone()).unwrap() {
+            EditorOperationResult::Single(Some(content)) => assert_eq!(content, ""),
+            _ => panic!("Expected empty content for view [1,-1] on empty file"),
+        }
 
         args_empty.view_range = Some(vec![2, 2]);
         assert!(handle_command(&mut editor, args_empty.clone())
@@ -638,7 +698,7 @@ mod tests {
 
         // insert into non-existent file
         let non_existent_path = dir.path().join("ghost.txt").to_str().unwrap().to_string();
-        args.path = non_existent_path;
+        args.path = Some(non_existent_path);
         args.insert_line = Some(1);
         assert!(handle_command(&mut editor, args.clone())
             .unwrap_err()
