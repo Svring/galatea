@@ -2,7 +2,7 @@ use poem::{Route, get, handler, post, web::Json, http::StatusCode, Error as Poem
 use crate::api::models::{FindFilesRequest, FindFilesResponse};
 use crate::file_system; // For find_files_by_extensions - will be file_system::search
 use tokio::process::Command; // Re-add for direct command execution
-use crate::file_system::paths::get_project_root; // Ensure this is imported
+use crate::file_system::paths::{get_project_root, resolve_path}; // Add resolve_path import
 // crate::terminal::npm::run_npm_command is no longer needed here
 // crate::file_system::paths::get_project_root is no longer needed here for these handlers
 
@@ -23,7 +23,16 @@ async fn project_health() -> &'static str {
 async fn find_files_handler(
     Json(req): Json<FindFilesRequest>,
 ) -> Result<Json<FindFilesResponse>, PoemError> {
-    let dir = std::path::PathBuf::from(&req.dir);
+    // Resolve the directory path using resolve_path
+    let dir = match resolve_path(&req.dir) {
+        Ok(path) => path,
+        Err(e) => {
+            return Err(PoemError::from_string(
+                format!("Failed to resolve directory: {}", e),
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+    };
     let suffixes_ref: Vec<&str> = req.suffixes.iter().map(|s| s.as_str()).collect();
     let exclude_dirs = req.exclude_dirs.unwrap_or_else(|| {
         vec![

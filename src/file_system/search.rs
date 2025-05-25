@@ -33,12 +33,12 @@ fn find_files_recursive(
     exclude_dirs: &[&str],
     matching_files: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    // Combined guard: Skip if not a directory or if directory is in exclude list
+    // Combined guard: Skip if not a directory or if directory is in exclude list or is hidden (starts with '.')
     if !current_path.is_dir()
         || current_path
             .file_name()
             .and_then(|n| n.to_str())
-            .map_or(false, |dir_name| exclude_dirs.contains(&dir_name))
+            .map_or(false, |dir_name| exclude_dirs.contains(&dir_name) || dir_name.starts_with('.'))
     {
         return Ok(());
     }
