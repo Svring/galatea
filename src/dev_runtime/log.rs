@@ -4,6 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use anyhow::{Result, anyhow};
 
+// Added imports for file logging
+use std::path::Path;
+use chrono::Local;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_appender::rolling; // For rolling::never
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum LogSource {
     // Debugger sources (original names, consider namespacing if they become too generic)
@@ -169,4 +175,19 @@ pub fn clear_shared_logs() -> Result<()> {
         .map_err(|_| anyhow!("Failed to acquire shared log store lock for clearing"))?;
     store_guard.clear();
     Ok(())
+}
+
+// New function to initialize file-based tracing
+pub fn init_file_logger(project_root: &Path) -> Result<(NonBlocking, WorkerGuard), anyhow::Error> {
+    let log_dir = project_root.join("galatea_log");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| anyhow!("Failed to create log directory {}: {}", log_dir.display(), e))?;
+
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let log_file_name = format!("galatea_run_{}.log", timestamp);
+
+    let file_appender = rolling::never(&log_dir, &log_file_name);
+    let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
+
+    Ok((non_blocking_appender, guard))
 } 

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::api::models::{EditorCommandRequest, EditorCommandResponse, EditorFileViewResponse};
 use crate::dev_operation::editor::{self, Editor, EditorOperationResult, MultiFileViewOutput};
 use crate::file_system; // For resolve_path
+use crate::file_system::paths::get_project_root;
 
 #[handler]
 async fn editor_api_health() -> &'static str {
@@ -93,8 +94,26 @@ async fn editor_command_api_handler(
         // For create, path is needed but doesn't need to exist yet.
         // It could be single path or, if extended in future, multiple. Here, only single `path` for create.
         if let Some(p_str) = &req.path {
-             resolved_single_path = Some(file_system::resolve_path(p_str)
-                .map_err(|e| PoemError::from_string(e.to_string(), StatusCode::BAD_REQUEST))?);
+            // Custom logic for new file creation: join to project root, canonicalize parent, check containment
+            let proj_root = get_project_root().map_err(|e| PoemError::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+            let requested_path = std::path::Path::new(p_str);
+            let candidate = if requested_path.is_absolute() {
+                if requested_path.starts_with(&proj_root) {
+                    requested_path.to_path_buf()
+                } else {
+                    proj_root.join(requested_path.file_name().unwrap_or_default())
+                }
+            } else {
+                let stripped = requested_path.strip_prefix(proj_root.file_name().unwrap_or_default()).unwrap_or(requested_path);
+                proj_root.join(stripped)
+            };
+            // Canonicalize parent to check containment
+            let parent = candidate.parent().ok_or_else(|| PoemError::from_string("Invalid path: no parent directory".to_string(), StatusCode::BAD_REQUEST))?;
+            let canonical_parent = dunce::canonicalize(parent).map_err(|e| PoemError::from_string(format!("Failed to canonicalize parent directory: {}", e), StatusCode::BAD_REQUEST))?;
+            if !canonical_parent.starts_with(&proj_root) {
+                return Err(PoemError::from_string("Target path is outside the project root".to_string(), StatusCode::BAD_REQUEST));
+            }
+            resolved_single_path = Some(candidate);
         } else {
             // This case should be caught by earlier validation for create requiring `path`
             return Err(PoemError::from_string("'path' is required for create.", StatusCode::BAD_REQUEST));

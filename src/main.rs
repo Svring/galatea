@@ -10,6 +10,12 @@ use tokio::time::sleep as tokio_sleep; // Alias to avoid conflict if Duration::s
 use tracing::{error, info, warn}; // For return type of initialize_environment // Added for timing
 use dashmap::DashMap; // For codex task state
 
+// Tracing subscriber imports for layered logging
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+
 // Use modules
 use galatea::api; // New api module
 use galatea::dev_operation; // Existing module, may need internal updates
@@ -138,7 +144,8 @@ async fn launch_api_server(host: &str, port: u16) -> Result<()> {
             Cors::new()
                 .allow_credentials(true)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(["Content-Type", "Authorization"]),
+                .allow_headers(["Content-Type", "Authorization"])
+                .allow_origin("*") // Allow all origins for CORS
         );
 
     // Use ensure_port_is_free from the terminal module
@@ -173,31 +180,71 @@ async fn launch_api_server(host: &str, port: u16) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    info!(target: "galatea::main", "Galatea application starting...");
+    //tracing_subscriber::fmt::init(); // This will be replaced
+    //info!(target: "galatea::main", "Galatea application starting..."); // Logged after subscriber setup
 
     let cli = Cli::parse(); // Parse command-line arguments
 
-    info!(target: "galatea::main", "Phase 1: Initializing environment...");
-
-    let now = Instant::now(); // Start timer
-    let initialize_result = initialize_environment(cli.api_key).await;
-    let elapsed = now.elapsed();
+    // --- Phase 1: Initializing environment (determine project_directory first) ---
+    let now_init_env = Instant::now();
+    let initialize_result = initialize_environment(cli.api_key.clone()).await; // Clone api_key if needed later
+    let elapsed_init_env = now_init_env.elapsed();
 
     let project_directory = match initialize_result {
         Ok(dir) => {
-            info!(target: "galatea::main", source_component = "bootstrap", path = %dir.display(), duration_ms = elapsed.as_millis(), "Project environment verified and set up successfully.");
+            // Log this after subscriber is set up
             dir
         }
         Err(e) => {
-            error!(target: "galatea::main", source_component = "bootstrap", error = ?e, duration_ms = elapsed.as_millis(), "Failed to verify and set up project environment. Server will not start.");
+            // Log this after subscriber is set up, but we need to print to stderr if subscriber fails
+            eprintln!(
+                "[ERROR] Failed to verify and set up project environment (duration: {}ms): {:?}. Server will not start.",
+                elapsed_init_env.as_millis(),
+                e
+            );
             return Err(e);
         }
     };
-    // The following log is a bit redundant if success is logged above with duration, but kept for consistency if initialize_result itself was not logged.
-    // info!(target: "galatea::main", "Phase 1: Environment initialized successfully.");
 
-    info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)...");
+    // --- Initialize Logging (File and Console) ---
+    let file_log_guard = match dev_runtime::log::init_file_logger(&project_directory) {
+        Ok((file_writer, guard)) => {
+            let file_layer = fmt::layer()
+                .with_writer(file_writer)
+                .with_ansi(false); // No ANSI colors in file logs
+
+            let console_layer = fmt::layer()
+                .with_writer(std::io::stdout); // Or std::io::stderr based on preference
+
+            tracing_subscriber::registry()
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+                .with(console_layer)
+                .with(file_layer)
+                .init();
+            
+            info!(target: "galatea::main", "File and console logging initialized.");
+            Some(guard) // Store the guard to keep it alive
+        }
+        Err(e) => {
+            eprintln!(
+                "[WARN] Failed to initialize file logger: {}. Falling back to console-only logging.",
+                e
+            );
+            // Fallback to basic console logging if file logging fails
+            tracing_subscriber::fmt::init();
+            None
+        }
+    };
+
+    // Now that logging is initialized, log the initial messages
+    info!(target: "galatea::main", "Galatea application starting...");
+    info!(target: "galatea::main", "Phase 1: Initializing environment...");
+
+    if project_directory.exists() { // Check if project_directory was successfully determined before logging success
+        info!(target: "galatea::main", source_component = "bootstrap", path = %project_directory.display(), duration_ms = elapsed_init_env.as_millis(), "Project environment verified and set up successfully.");
+    } // Error case was handled above and returned
+
+    info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)..." );
     // Call the new function within tokio::spawn
     tokio::spawn(launch_nextjs_dev_server_task(project_directory.clone()));
 
@@ -211,5 +258,11 @@ async fn main() -> Result<()> {
         return Err(e);
     }
     info!(target: "galatea::main", "Galatea application shutdown.");
+
+    // Keep the guard in scope until main exits, if it was created
+    if let Some(_guard) = file_log_guard {
+        // _guard is kept alive here
+    }
+
     Ok(())
 }
