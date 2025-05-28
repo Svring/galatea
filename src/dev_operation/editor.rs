@@ -273,6 +273,19 @@ fn create_file(editor: &mut Editor, path: &Path, content: &str) -> Result<Option
         None
     };
 
+    // Create parent directories if they don't exist
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Error creating parent directories for '{}': {}",
+                    path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
     fs::write(path, content)
         .map_err(|e| format!("Error writing file '{}': {}", path.display(), e))?;
 
@@ -731,5 +744,43 @@ mod tests {
             LastOperation::Create { ref path } if path.to_str() == Some("dummy") => {}
             _ => panic!("last_op should not have been updated by a no-op replace"),
         }
+    }
+
+    #[test]
+    fn test_create_with_parent_directories() {
+        let dir = tempdir().unwrap();
+        let mut editor = Editor::new();
+        
+        // Test creating a file in nested directories that don't exist
+        let nested_file_path = dir.path().join("level1").join("level2").join("level3").join("test.txt");
+        let file_path_str = nested_file_path.to_str().unwrap();
+        
+        // Verify parent directories don't exist initially
+        assert!(!nested_file_path.parent().unwrap().exists());
+        
+        // Create file with nested path
+        let create_args = EditorArgs {
+            file_text: Some("Hello from nested file!".to_string()),
+            ..make_args_struct(CommandType::Create, file_path_str)
+        };
+        
+        // This should succeed and create all parent directories
+        handle_command(&mut editor, create_args).unwrap();
+        
+        // Verify the file was created
+        assert!(nested_file_path.exists());
+        assert_eq!(fs::read_to_string(&nested_file_path).unwrap(), "Hello from nested file!");
+        
+        // Verify all parent directories were created
+        assert!(nested_file_path.parent().unwrap().exists());
+        assert!(nested_file_path.parent().unwrap().parent().unwrap().exists());
+        assert!(nested_file_path.parent().unwrap().parent().unwrap().parent().unwrap().exists());
+        
+        // Test undo - should remove the file but leave directories
+        let undo_args = make_args_struct(CommandType::UndoEdit, file_path_str);
+        handle_command(&mut editor, undo_args).unwrap();
+        assert!(!nested_file_path.exists());
+        // Parent directories should still exist after undo
+        assert!(nested_file_path.parent().unwrap().exists());
     }
 } 

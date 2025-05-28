@@ -6,7 +6,7 @@ use poem::{Route, get};
 // Health check endpoint for the API module itself
 #[poem::handler]
 async fn health() -> &'static str {
-    "Galatea API module is running"
+    "Galatea is online."
 }
 
 pub fn api_routes() -> Route {
