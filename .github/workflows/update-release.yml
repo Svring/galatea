@@ -1,0 +1,46 @@
+name: Update Galatea Release
+
+on:
+  push:
+    branches:
+      - main  # Trigger on push to main branch
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build binary
+        run: |
+          cross build --target x86_64-unknown-linux-gnu --release
+          # Ensure the binary is in the expected location
+          ls target/x86_64-unknown-linux-gnu/release/galatea
+
+      - name: Delete existing release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete the existing release and tag if they exist
+          gh release delete v0.1 --yes || true
+          git push origin :refs/tags/v0.1 || true
+
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create a new release with the same tag
+          gh release create v0.1 ./target/x86_64-unknown-linux-gnu/release/galatea \
+            --title "Galatea v0.1" \
+            --notes "Latest build of Galatea v0.1" \
+            --prerelease
