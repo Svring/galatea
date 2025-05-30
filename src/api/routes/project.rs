@@ -3,7 +3,7 @@ use crate::api::models::{FindFilesRequest, FindFilesResponse};
 use crate::file_system; // For find_files_by_extensions - will be file_system::search
 use tokio::process::Command; // Re-add for direct command execution
 use crate::file_system::paths::{get_project_root, resolve_path}; // Add resolve_path import
-// crate::terminal::npm::run_npm_command is no longer needed here
+// crate::terminal::pnpm::run_pnpm_command could be used here instead of direct Command
 // crate::file_system::paths::get_project_root is no longer needed here for these handlers
 
 #[derive(serde::Serialize)]
@@ -69,13 +69,13 @@ async fn lint_handler() -> Result<Json<ScriptResponse>, PoemError> {
         PoemError::from_string(format!("Failed to get project root: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
     )?;
 
-    let mut cmd = Command::new("npm");
+    let mut cmd = Command::new("pnpm");
     cmd.current_dir(&project_root) // Set current directory to project root
        .arg("run")
        .arg("lint");
     
     let output = cmd.output().await.map_err(|e| 
-        PoemError::from_string(format!("Failed to execute npm lint: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
+        PoemError::from_string(format!("Failed to execute pnpm lint: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
     )?;
 
     Ok(Json(ScriptResponse {
@@ -92,13 +92,13 @@ async fn format_handler() -> Result<Json<ScriptResponse>, PoemError> {
         PoemError::from_string(format!("Failed to get project root: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
     )?;
 
-    let mut cmd = Command::new("npm");
+    let mut cmd = Command::new("pnpm");
     cmd.current_dir(&project_root) // Set current directory to project root
        .arg("run")
        .arg("format");
 
     let output = cmd.output().await.map_err(|e| 
-        PoemError::from_string(format!("Failed to execute npm format: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
+        PoemError::from_string(format!("Failed to execute pnpm format: {}", e), StatusCode::INTERNAL_SERVER_ERROR)
     )?;
 
     Ok(Json(ScriptResponse {

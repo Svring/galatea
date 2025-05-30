@@ -15,6 +15,8 @@ pub enum LogSource {
     // Debugger sources (original names, consider namespacing if they become too generic)
     DebuggerNpmStdout,
     DebuggerNpmStderr,
+    DebuggerPnpmStdout,
+    DebuggerPnpmStderr,
     DebuggerGeneral,
 
     // Watcher general sources - These might be deprecated by ScriptRunner ones

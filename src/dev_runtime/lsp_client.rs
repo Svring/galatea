@@ -29,7 +29,7 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    // Note: The actual spawning of the LSP server process (npm run lsp)
+    // Note: The actual spawning of the LSP server process (pnpm run lsp)
     // should ideally be managed by a higher-level process supervisor (e.g., in dev_runtime)
     // This `new` function will assume the process is started elsewhere and pipes are provided,
     // or it could be adapted to take a pre-spawned Child process.
@@ -38,7 +38,7 @@ impl LspClient {
         let project_dir = file_system::get_project_root()?;
 
         let msg_spawn = format!(
-            "Spawning LSP server (npm run lsp) in {}",
+            "Spawning LSP server (pnpm run lsp) in {}",
             project_dir.display()
         );
         log::add_log_entry(
@@ -48,7 +48,7 @@ impl LspClient {
         );
         tracing::info!(target: "galatea::dev_runtime::lsp_client", source_process = "lsp_server_spawner", "{}", msg_spawn);
 
-        let mut cmd = TokioCommand::new("npm");
+        let mut cmd = TokioCommand::new("pnpm");
         cmd.current_dir(&project_dir)
             .args(&["run", "lsp"]) // The script "lsp": "typescript-language-server --stdio"
             .stdin(Stdio::piped())
@@ -57,7 +57,7 @@ impl LspClient {
 
         let mut child = cmd.spawn().with_context(|| {
             format!(
-                "Failed to spawn 'npm run lsp' in project dir: {}",
+                "Failed to spawn 'pnpm run lsp' in project dir: {}",
                 project_dir.display()
             )
         })?;
@@ -65,16 +65,16 @@ impl LspClient {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("Failed to get LSP stdin after 'npm run lsp'"))?;
+            .ok_or_else(|| anyhow!("Failed to get LSP stdin after 'pnpm run lsp'"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("Failed to get LSP stdout after 'npm run lsp'"))?;
+            .ok_or_else(|| anyhow!("Failed to get LSP stdout after 'pnpm run lsp'"))?;
         let stderr_reader = BufReader::new(
             child
                 .stderr
                 .take()
-                .ok_or_else(|| anyhow!("Failed to get LSP stderr after 'npm run lsp'"))?,
+                .ok_or_else(|| anyhow!("Failed to get LSP stderr after 'pnpm run lsp'"))?,
         );
 
         let (response_tx, response_rx) = mpsc::channel(128);
