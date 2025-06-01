@@ -22,6 +22,7 @@ lsp-types = "0.97.0"
 once_cell = "1.21.3"
 path-absolutize = "3.1.1"
 poem = { version = "3.1.10", features = ["static-files"] }
+poem-openapi = {version = "5.1.14", features = ["swagger-ui", "scalar"]}
 port-killer = "0.1.0"
 qdrant-client = "1.9.0"
 serde = {version = "1.0", features = ["derive"]}
@@ -29,6 +30,7 @@ serde_json = "1.0"
 swiftide = {version = "0.25.1", features = ["openai", "qdrant", "redis", "tree-sitter"]}
 tempfile = "3.10.1"
 tokio = {version = "1.44.2", features = ["full"]}
+toml = "0.8.22"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "registry", "env-filter"] }

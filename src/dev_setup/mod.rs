@@ -24,7 +24,16 @@ pub async fn ensure_development_environment(
         .parent()
         .context("Failed to get executable directory")?;
     let galatea_files_dir = exe_dir.join("galatea_files");
-    if !galatea_files_dir.exists() {
+    let config_toml = galatea_files_dir.join("config.toml");
+    let project_structure_json = galatea_files_dir.join("project_structure.json");
+    let developer_note_md = galatea_files_dir.join("developer_note.md");
+    let mut need_reinit_project = false;
+    if galatea_files_dir.exists() {
+        if !config_toml.exists() || !project_structure_json.exists() || !developer_note_md.exists() {
+            tracing::warn!(target: "dev_setup", "Some config files are missing. Project will be reinitialized.");
+            need_reinit_project = true;
+        }
+    } else {
         config_files::create_galatea_files_folder()?;
     }
 
@@ -34,6 +43,11 @@ pub async fn ensure_development_environment(
         Some(url) => url,
         None => "https://github.com/Svring/nextjs-project",
     };
+
+    // If project needs reinit, remove the project directory if it exists
+    if need_reinit_project && project_dir_path.exists() {
+        std::fs::remove_dir_all(&project_dir_path).context("Failed to remove existing project directory for reinit")?;
+    }
 
     nextjs::scaffold_nextjs_project(&project_dir_path, template_url)
         .await

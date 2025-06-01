@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::api::models::EditorFileViewResponse; // Import for multi-view response
+use once_cell::sync::Lazy;
+use std::sync::{Arc, Mutex};
+
+// Global shared editor state
+pub static SHARED_EDITOR: Lazy<Arc<Mutex<Editor>>> = Lazy::new(|| Arc::new(Mutex::new(Editor::new())));
 
 // Enum to represent the type of the last operation for undo functionality
 #[derive(Debug)]
