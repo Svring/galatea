@@ -4,6 +4,7 @@ use crate::file_system;
 use tokio::process::Command;
 use crate::file_system::paths::{get_project_root, resolve_path};
 use std::fs;
+use walkdir::WalkDir;
 
 // Define an API struct
 pub struct ProjectApi;
@@ -82,6 +83,18 @@ enum GalateaFileGetResponse {
     InternalServerError(PlainText<String>),
 }
 
+#[derive(Object, serde::Serialize)]
+pub struct GalateaFilesListResponse {
+    pub entries: Vec<String>,
+}
+
+#[derive(ApiResponse)]
+enum GalateaFilesListApiResponse {
+    #[oai(status = 200)]
+    Ok(OpenApiJson<GalateaFilesListResponse>),
+    #[oai(status = 500)]
+    InternalServerError(PlainText<String>),
+}
 
 #[OpenApi]
 impl ProjectApi {
@@ -236,6 +249,44 @@ impl ProjectApi {
             Ok(content) => GalateaFileGetResponse::Ok(PlainText(content)),
             Err(e) => GalateaFileGetResponse::NotFound(PlainText(format!("Failed to read file {}: {}", filename.0, e))),
         }
+    }
+
+    /// List all files and folders under the galatea_files folder (recursively)
+    #[oai(path = "/list-galatea-files", method = "get")]
+    async fn list_galatea_files_handler(&self) -> GalateaFilesListApiResponse {
+        use std::path::Path;
+        let exe_path = match std::env::current_exe() {
+            Ok(ep) => ep,
+            Err(e) => return GalateaFilesListApiResponse::InternalServerError(PlainText(e.to_string())),
+        };
+        let exe_dir = match exe_path.parent() {
+            Some(ed) => ed,
+            None => return GalateaFilesListApiResponse::InternalServerError(PlainText("Failed to get executable directory".to_string())),
+        };
+        let galatea_files_dir = exe_dir.join("galatea_files");
+        if !galatea_files_dir.exists() {
+            return GalateaFilesListApiResponse::InternalServerError(PlainText("galatea_files directory does not exist".to_string()));
+        }
+        let mut entries = Vec::new();
+        let walker = WalkDir::new(&galatea_files_dir).into_iter();
+        for entry in walker {
+            match entry {
+                Ok(e) => {
+                    let path = e.path();
+                    if path == galatea_files_dir {
+                        continue;
+                    }
+                    // Get the relative path from galatea_files_dir
+                    if let Ok(rel_path) = path.strip_prefix(&galatea_files_dir) {
+                        entries.push(rel_path.to_string_lossy().to_string());
+                    }
+                }
+                Err(e) => {
+                    return GalateaFilesListApiResponse::InternalServerError(PlainText(format!("Failed to read entry: {}", e)));
+                }
+            }
+        }
+        GalateaFilesListApiResponse::Ok(OpenApiJson(GalateaFilesListResponse { entries }))
     }
 }
 

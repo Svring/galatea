@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser; // Added for command-line argument parsing
 use std::time::Instant;
-use tracing::{error, info}; // For return type of initialize_environment
+use tracing::info;
 
 // Tracing subscriber imports for layered logging
 use tracing_subscriber::EnvFilter;
@@ -24,6 +24,10 @@ use poem_openapi::{OpenApi, OpenApiService};
 use galatea::api::routes::project::ProjectApi;
 use galatea::api::routes::editor_api::EditorApi;
 
+// Import for MCP proxy functionality
+use poem::{handler, web::Path as PoemPath, Response};
+use poem::http::StatusCode;
+
 // Define command-line arguments
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -32,6 +36,8 @@ struct Cli {
     token: Option<String>,
     #[clap(long, default_value = "nextjs")]
     template: Option<String>,
+    #[clap(long, default_value_t = false)]
+    mcp_enabled: bool,
 }
 
 // Combined API struct
@@ -44,6 +50,84 @@ impl GalateaApi {
     async fn health(&self) -> poem_openapi::payload::PlainText<String> {
         poem_openapi::payload::PlainText("Galatea is online.".to_string())
     }
+}
+
+// MCP Proxy handler
+#[handler]
+async fn mcp_proxy(
+    req: &poem::Request,
+    body: poem::Body,
+) -> poem::Result<Response> {
+    // Extract the path manually
+    let path = req.uri().path();
+    
+    // Parse the path to extract api_type and subpath
+    // Expected format: /api/{api_type}/mcp[/{subpath}]
+    let path_parts: Vec<&str> = path.split('/').collect();
+    if path_parts.len() < 4 || path_parts[1] != "api" || path_parts[3] != "mcp" {
+        return Err(poem::Error::from_string("Invalid MCP proxy path", StatusCode::BAD_REQUEST));
+    }
+    
+    let api_type = path_parts[2];
+    let subpath = if path_parts.len() > 4 {
+        path_parts[4..].join("/")
+    } else {
+        String::new()
+    };
+    
+    // Get the MCP definitions from app data
+    let mcp_definitions = req.data::<Vec<galatea::dev_runtime::types::McpServiceDefinition>>()
+        .ok_or_else(|| poem::Error::from_string("MCP definitions not found", StatusCode::INTERNAL_SERVER_ERROR))?;
+    
+    // Find the matching MCP server
+    let mcp_def = mcp_definitions.iter()
+        .find(|def| def.id == api_type)
+        .ok_or_else(|| poem::Error::from_string(format!("MCP server '{}' not found", api_type), StatusCode::NOT_FOUND))?;
+    
+    // Build the target URL
+    let target_url = if subpath.is_empty() {
+        format!("http://127.0.0.1:{}/mcp", mcp_def.port)
+    } else {
+        format!("http://127.0.0.1:{}/mcp/{}", mcp_def.port, subpath)
+    };
+    
+    // Create HTTP client
+    let client = reqwest::Client::new();
+    
+    // Forward the request
+    let mut proxy_req = client.request(req.method().clone(), &target_url);
+    
+    // Copy headers
+    for (key, value) in req.headers() {
+        if key != "host" {
+            proxy_req = proxy_req.header(key, value);
+        }
+    }
+    
+    // Forward body
+    let body_bytes = body.into_bytes().await?;
+    proxy_req = proxy_req.body(body_bytes);
+    
+    // Send request
+    let resp = proxy_req.send().await
+        .map_err(|e| poem::Error::from_string(format!("Proxy error: {}", e), StatusCode::BAD_GATEWAY))?;
+    
+    // Build response
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await
+        .map_err(|e| poem::Error::from_string(format!("Failed to read response body: {}", e), StatusCode::BAD_GATEWAY))?;
+    
+    let mut response = Response::builder().status(status);
+    
+    // Copy response headers
+    for (key, value) in headers {
+        if let Some(key) = key {
+            response = response.header(key, value);
+        }
+    }
+    
+    Ok(response.body(body))
 }
 
 #[tokio::main]
@@ -78,47 +162,67 @@ async fn main() -> Result<()> {
 
     info!(target: "galatea::main", source_component = "bootstrap", path = %project_directory.display(), duration_ms = now_init_env.elapsed().as_millis(), "Project environment verified and set up successfully.");
 
-    info!(target: "galatea::main", "Phase 2: Launching background services (Next.js)...");
-    let nextjs_project_dir = project_directory.clone();
-    tokio::spawn(async move {
-        info!(target: "galatea::main", source_component = "next_dev_server_supervisor", path = %nextjs_project_dir.display(), "Attempting to start the Next.js development server...");
-        match dev_runtime::nextjs_dev_server::launch_dev_server(&nextjs_project_dir).await {
-            Ok(_) => {
-                info!(target: "galatea::main", source_component = "next_dev_server_supervisor", "Next.js development server process has finished.")
-            }
-            Err(e) => {
-                error!(target: "galatea::main", source_component = "next_dev_server_supervisor", error = ?e, "Failed to start or monitor the Next.js development server.")
-            }
-        }
-    });
+    info!(target: "galatea::main", "Phase 2: Launching runtime services (Next.js and MCP servers if enabled)...");
+    
+    // Launch runtime services and get MCP definitions
+    let mcp_definitions = dev_runtime::launch_runtime_services(project_directory.clone(), cli.mcp_enabled)
+        .await
+        .context("Failed to launch runtime services")?;
+    
+    if !mcp_definitions.is_empty() {
+        info!(target: "galatea::main", count = mcp_definitions.len(), "MCP servers initiated: {:?}", mcp_definitions);
+        // Give MCP servers time to start up
+        info!(target: "galatea::main", "Waiting 3 seconds for MCP servers to initialize...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    }
 
     let host = "0.0.0.0";
     let port = 3051;
     let _span = tracing::info_span!(target: "galatea::main", "start_server", host, port).entered();
 
-    // Create OpenAPI services for each API module
+    // --- OpenAPI Services ---
     let main_api_service = OpenApiService::new(GalateaApi, "Galatea API", "1.0")
         .server(format!("http://localhost:{}/api", port));
-    
     let project_api_service = OpenApiService::new(ProjectApi, "Project API", "1.0")
         .server(format!("http://localhost:{}/api/project", port));
-    
     let editor_api_service = OpenApiService::new(EditorApi, "Editor API", "1.0")
         .server(format!("http://localhost:{}/api/editor", port));
 
-    // Create Scalar UI for each API
-    let scalar_ui = main_api_service.scalar();
-    let project_scalar_ui = project_api_service.scalar();
-    let editor_scalar_ui = editor_api_service.scalar();
+    // --- Scalar UI & Spec Endpoints ---
+    let main_api_scalar = main_api_service.scalar();
+    let main_api_spec = main_api_service.spec_endpoint();
+    let project_api_scalar = project_api_service.scalar();
+    let project_api_spec = project_api_service.spec_endpoint();
+    let editor_api_scalar = editor_api_service.scalar();
+    let editor_api_spec = editor_api_service.spec_endpoint();
 
-    // Build the application routes
-    let app = Route::new()
+    // --- Route Setup ---
+    let mut app = Route::new()
+        // Main API
         .nest("/api", main_api_service)
+        .nest("/api/scalar", main_api_scalar)
+        .at("/api/spec", main_api_spec)
+        // Project API
         .nest("/api/project", project_api_service)
+        .nest("/api/project/scalar", project_api_scalar)
+        .at("/api/project/spec", project_api_spec)
+        // Editor API
         .nest("/api/editor", editor_api_service)
-        .nest("/api/scalar", scalar_ui)
-        .nest("/api/project/scalar", project_scalar_ui)
-        .nest("/api/editor/scalar", editor_scalar_ui)
+        .nest("/api/editor/scalar", editor_api_scalar)
+        .at("/api/editor/spec", editor_api_spec);
+    
+    // Add MCP proxy routes dynamically based on definitions
+    for mcp_def in &mcp_definitions {
+        let route_pattern = format!("/api/{}/mcp", mcp_def.id);
+        let route_pattern_with_path = format!("/api/{}/mcp/*", mcp_def.id);
+        info!(target: "galatea::main", "Adding MCP proxy routes: {} and {} -> http://127.0.0.1:{}/mcp", route_pattern, route_pattern_with_path, mcp_def.port);
+        app = app.at(&route_pattern, mcp_proxy);
+        app = app.at(&route_pattern_with_path, mcp_proxy);
+    }
+    
+    // Build final app with data and middleware
+    let app = app
+        .data(mcp_definitions)
         .with(
             Cors::new()
                 .allow_credentials(true)

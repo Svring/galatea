@@ -128,6 +128,12 @@ pub async fn ensure_port_is_free(port: u16, service_name: &str) -> Result<()> {
     }
 }
 
+/// Checks if a TCP port is available by trying to bind to it briefly.
+/// Returns true if available, false otherwise.
+pub async fn is_port_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).await.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

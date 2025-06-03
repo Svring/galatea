@@ -41,6 +41,9 @@ url = "2.5.4"
 uuid = {version = "1.6", features = ["v4"]}
 wasm-bindgen = "0.2.89"
 web-sys = { version = "0.3.66", features = ["Document", "Element", "HtmlElement", "Node", "Window", "Text"] }
+rmcp = { version = "0.1", features = ["server"] }
+walkdir = "2.5.0"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 [dev-dependencies]
 tempfile = "3.10.1"
