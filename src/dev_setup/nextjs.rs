@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use crate::terminal;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use tracing;
-use crate::terminal;
 
 pub async fn scaffold_nextjs_project(project_root: &Path, template_url: &str) -> Result<()> {
     tracing::info!(
@@ -64,7 +64,11 @@ mod tests {
 
         // Run the scaffold function
         let result = scaffold_nextjs_project(&project_root, template_url).await;
-        assert!(result.is_ok(), "scaffold_nextjs_project failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "scaffold_nextjs_project failed: {:?}",
+            result.err()
+        );
 
         // Check for package.json
         let package_json = project_root.join("package.json");
@@ -76,6 +80,9 @@ mod tests {
 
         // Check for node_modules (should exist if pnpm install succeeded)
         let node_modules = project_root.join("node_modules");
-        assert!(node_modules.exists(), "node_modules was not created (pnpm install may have failed)");
+        assert!(
+            node_modules.exists(),
+            "node_modules was not created (pnpm install may have failed)"
+        );
     }
-} 
+}

@@ -6,16 +6,17 @@ pub mod mcp_converter;
 
 use anyhow::{Context, Result};
 use tracing;
+use std::process::Stdio;
+use tokio::process::Command;
 
 pub async fn ensure_development_environment(
     template: Option<String>,
+    use_sudo: bool,
 ) -> Result<std::path::PathBuf> {
     tracing::info!(target: "dev_setup", "Attempting to ensure development environment...");
 
-    // Ensure galatea_files folder and its essential contents exist or are created/updated.
-    // This function is now designed to be idempotent and safe to call even if files exist.
-    config_files::create_galatea_files_folder()
-        .context("Failed to ensure galatea_files folder and its contents")?;
+    // Check and ensure Node.js version 20+ is available
+    ensure_node_version_20_or_higher().await?;
 
     // Get current working directory and determine project_dir_path
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -23,6 +24,7 @@ pub async fn ensure_development_environment(
         .parent()
         .context("Failed to get executable directory")?;
     let project_dir_path = exe_dir.join("project");
+    let galatea_files_dir = exe_dir.join("galatea_files");
 
     // Use custom template if provided, otherwise use default
     let template_url = match template.as_deref() {
@@ -31,9 +33,22 @@ pub async fn ensure_development_environment(
         None => "https://github.com/Svring/nextjs-project", // Default template
     };
 
-    // If the project directory doesn't exist, scaffold it.
-    // Otherwise, assume it's correctly set up or managed externally.
-    if !project_dir_path.exists() {
+    // If galatea_files does not exist, (re)create the project from template, even if project_dir_path exists
+    if !galatea_files_dir.exists() {
+        tracing::info!(target: "dev_setup", 
+            "galatea_files directory does not exist. (Re)scaffolding Next.js project from template: {}", 
+            template_url
+        );
+        // Remove the project directory if it exists to ensure a clean state
+        if project_dir_path.exists() {
+            tracing::info!(target: "dev_setup", "Removing existing project directory at {} before scaffolding.", project_dir_path.display());
+            std::fs::remove_dir_all(&project_dir_path).ok();
+        }
+        nextjs::scaffold_nextjs_project(&project_dir_path, template_url)
+            .await
+            .context("Failed to scaffold Next.js project")?;
+        tracing::info!(target: "dev_setup", path = %project_dir_path.display(), "Next.js project scaffolded successfully.");
+    } else if !project_dir_path.exists() {
         tracing::info!(target: "dev_setup", 
             "Project directory {} does not exist. Scaffolding Next.js project from template: {}", 
             project_dir_path.display(), template_url
@@ -44,15 +59,83 @@ pub async fn ensure_development_environment(
         tracing::info!(target: "dev_setup", path = %project_dir_path.display(), "Next.js project scaffolded successfully.");
     } else {
         tracing::info!(target: "dev_setup", 
-            "Project directory {} already exists. Skipping Next.js project scaffolding.", 
+            "Both galatea_files and project directory {} already exist. Skipping Next.js project scaffolding.", 
             project_dir_path.display()
         );
     }
 
+    // Ensure galatea_files folder and its essential contents exist or are created/updated.
+    config_files::create_galatea_files_folder()
+        .context("Failed to ensure galatea_files folder and its contents")?;
+
     // Ensure openapi-mcp-generator is installed globally
-    mcp_converter::ensure_openapi_mcp_generator_installed().await?;
+    mcp_converter::ensure_openapi_mcp_generator_installed(use_sudo).await?;
 
     Ok(project_dir_path)
+}
+
+/// Ensures Node.js version 20 or higher is available
+async fn ensure_node_version_20_or_higher() -> Result<()> {
+    tracing::info!(target: "dev_setup", "Checking Node.js version...");
+    
+    // Check current Node.js version
+    let version_check = Command::new("bash")
+        .arg("-c")
+        .arg("node --version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    
+    match version_check {
+        Ok(output) if output.status.success() => {
+            let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            tracing::info!(target: "dev_setup", current_version = %version_str, "Current Node.js version detected.");
+            
+            // Parse version (e.g., "v18.20.4" -> 18)
+            if let Some(version_num_str) = version_str.strip_prefix('v') {
+                if let Some(major_version_str) = version_num_str.split('.').next() {
+                    if let Ok(major_version) = major_version_str.parse::<u32>() {
+                        if major_version >= 20 {
+                            tracing::info!(target: "dev_setup", major_version = major_version, "Node.js version is sufficient (>=20).");
+                            return Ok(());
+                        } else {
+                            tracing::warn!(target: "dev_setup", major_version = major_version, "Node.js version is too old (<20). Attempting to install Node.js 20 with nvm...");
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(target: "dev_setup", "Node.js not found or version check failed. Attempting to install Node.js 20 with nvm...");
+        }
+    }
+    
+    // Try to install Node.js 20 using nvm
+    tracing::info!(target: "dev_setup", "Installing Node.js 20 using nvm...");
+    let nvm_install = Command::new("bash")
+        .arg("-c")
+        .arg("source ~/.nvm/nvm.sh && nvm install 20 && nvm use 20")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    
+    match nvm_install {
+        Ok(output) if output.status.success() => {
+            tracing::info!(target: "dev_setup", "Node.js 20 installed and activated successfully.");
+            Ok(())
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(target: "dev_setup", stderr = %stderr, "Failed to install Node.js 20 with nvm.");
+            Err(anyhow::anyhow!("Failed to install Node.js 20 with nvm: {}", stderr))
+        }
+        Err(e) => {
+            tracing::error!(target: "dev_setup", error = ?e, "Failed to execute nvm command.");
+            Err(anyhow::anyhow!("Failed to execute nvm command: {}", e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +170,7 @@ mod tests {
             fs::remove_dir_all(&galatea_files_dir).unwrap();
         }
 
-        let result = ensure_development_environment(Some("nextjs".to_string())).await;
+        let result = ensure_development_environment(Some("nextjs".to_string()), false).await;
         assert!(
             result.is_ok(),
             "ensure_development_environment failed: {:?}",

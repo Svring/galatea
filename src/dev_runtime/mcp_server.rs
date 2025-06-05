@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use tracing;
@@ -15,7 +14,7 @@ const MCP_OPENAPI_SPEC_PATH: &str = "/openapi.json"; // Assumed path on the MCP 
 /// Launches MCP (Model-Centric Proxy) servers for each OpenAPI specification file found.
 /// Each server is first generated, then built, and finally run as a separate process.
 /// Returns a list of definitions for successfully initiated servers.
-pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
+pub async fn create_mcp_servers(use_sudo: bool) -> Result<Vec<McpServiceDefinition>> {
     tracing::info!(target: "dev_runtime::mcp_server", "Initiating MCP server launch sequence...");
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -41,6 +40,8 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
     for entry in fs::read_dir(&openapi_spec_dir).context(format!("Failed to read OpenAPI specification directory at {}", openapi_spec_dir.display()))? {
         let entry = entry.context("Failed to read directory entry in openapi_specification")?;
         let spec_file_path = entry.path();
+        
+        tracing::debug!(target: "dev_runtime::mcp_server", path = %spec_file_path.display(), "Found file in openapi_specification directory.");
 
         if spec_file_path.is_file() {
             let extension = spec_file_path.extension().and_then(|s| s.to_str());
@@ -48,6 +49,8 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
                 tracing::debug!(target: "dev_runtime::mcp_server", path = %spec_file_path.display(), "Skipping non-JSON/YAML file in openapi_specification directory.");
                 continue;
             }
+            
+            tracing::info!(target: "dev_runtime::mcp_server", path = %spec_file_path.display(), "Processing OpenAPI specification file.");
 
             let file_stem = spec_file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
             // Convert "project_api.json" to "project_mcp"
@@ -85,7 +88,11 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
                 Ok(meta) => Some(meta),
                 Err(e) => {
                     tracing::info!(target: "dev_runtime::mcp_server", path = %spec_file_path.display(), error = ?e, "Failed to get metadata for spec file. Skipping regeneration check.");
-                    fs::remove_dir_all(&dedicated_project_path).ok();
+                    if let Err(remove_err) = fs::remove_dir_all(&dedicated_project_path) {
+                        if remove_err.kind() != std::io::ErrorKind::NotFound {
+                            tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?remove_err, "Failed to delete old server directory before regeneration.");
+                        }
+                    }
                     None
                 }
             };
@@ -93,7 +100,11 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
                 Ok(meta) => Some(meta),
                 Err(e) => {
                     tracing::info!(target: "dev_runtime::mcp_server", path = %dedicated_project_path.display(), error = ?e, "Failed to get metadata for server directory. Forcing regeneration.");
-                    fs::remove_dir_all(&dedicated_project_path).ok();
+                    if let Err(remove_err) = fs::remove_dir_all(&dedicated_project_path) {
+                        if remove_err.kind() != std::io::ErrorKind::NotFound {
+                            tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?remove_err, "Failed to delete old server directory before regeneration.");
+                        }
+                    }
                     None
                 }
             };
@@ -103,8 +114,10 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
                 if spec_time > server_time {
                     tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "Spec file is newer than server directory. Deleting and regenerating server.");
                     if let Err(e) = fs::remove_dir_all(&dedicated_project_path) {
-                        tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to delete old server directory before regeneration.");
-                        continue;
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to delete old server directory before regeneration.");
+                            continue;
+                        }
                     }
                     need_generate = true;
                 } else {
@@ -115,41 +128,103 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
                 // If we can't get modification times, force regeneration
                 tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "Could not determine modification times. Forcing regeneration.");
                 if let Err(e) = fs::remove_dir_all(&dedicated_project_path) {
-                    tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to delete old server directory before regeneration.");
-                    continue;
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to delete old server directory before regeneration.");
+                        continue;
+                    }
                 }
                 need_generate = true;
             }
 
             if need_generate {
                 let spec_file_path_str = spec_file_path.to_string_lossy().to_string();
-                let mut generator_cmd = Command::new("openapi-mcp-generator");
-                generator_cmd.arg("--input")
-                   .arg(&spec_file_path_str)
-                   .arg("--output")
-                   .arg(dedicated_project_path.to_string_lossy().as_ref())
-                   .arg("--transport=streamable-http")
-                   .arg(format!("--port={}", assigned_port))
-                   .stdout(Stdio::piped())
-                   .stderr(Stdio::piped());
                 
-                tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "Running openapi-mcp-generator...");
-                match generator_cmd.output().await {
-                    Ok(generator_output) => {
-                        if !generator_output.status.success() {
-                            tracing::error!(target: "dev_runtime::mcp_server", 
-                                server_name = %server_name, 
-                                status = %generator_output.status,
-                                stdout = %String::from_utf8_lossy(&generator_output.stdout),
-                                stderr = %String::from_utf8_lossy(&generator_output.stderr),
-                                "openapi-mcp-generator failed for {}. Skipping server launch.", server_name);
-                            continue; 
+                if use_sudo {
+                    // Use sudo to run as root
+                    let generator_command_str = format!(
+                        "sudo openapi-mcp-generator --input '{}' --output '{}' --transport=streamable-http --port={}",
+                        spec_file_path_str,
+                        dedicated_project_path.to_string_lossy(),
+                        assigned_port
+                    );
+                    let mut generator_cmd = Command::new("bash");
+                    generator_cmd.arg("-c").arg(&generator_command_str)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, command = %generator_command_str, "Running openapi-mcp-generator as root (sudo)...");
+                    match generator_cmd.output().await {
+                        Ok(generator_output) => {
+                            if !generator_output.status.success() {
+                                tracing::error!(target: "dev_runtime::mcp_server", 
+                                    server_name = %server_name, 
+                                    status = %generator_output.status,
+                                    stdout = %String::from_utf8_lossy(&generator_output.stdout),
+                                    stderr = %String::from_utf8_lossy(&generator_output.stderr),
+                                    "openapi-mcp-generator failed for {}. Skipping server launch.", server_name);
+                                continue; 
+                            }
+                            tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "openapi-mcp-generator completed successfully.");
                         }
-                        tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "openapi-mcp-generator completed successfully.");
+                        Err(e) => {
+                            tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to execute openapi-mcp-generator. Skipping server launch.");
+                            continue;
+                        }
+                    }
+                } else {
+                    // Run openapi-mcp-generator normally (without sudo to avoid password prompt)
+                    let mut generator_cmd = Command::new("openapi-mcp-generator");
+                    generator_cmd.arg("--input")
+                       .arg(&spec_file_path_str)
+                       .arg("--output")
+                       .arg(dedicated_project_path.to_string_lossy().as_ref())
+                       .arg("--transport=streamable-http")
+                       .arg(format!("--port={}", assigned_port))
+                       .stdout(Stdio::piped())
+                       .stderr(Stdio::piped());
+                    
+                    tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "Running openapi-mcp-generator...");
+                    match generator_cmd.output().await {
+                        Ok(generator_output) => {
+                            if !generator_output.status.success() {
+                                tracing::error!(target: "dev_runtime::mcp_server", 
+                                    server_name = %server_name, 
+                                    status = %generator_output.status,
+                                    stdout = %String::from_utf8_lossy(&generator_output.stdout),
+                                    stderr = %String::from_utf8_lossy(&generator_output.stderr),
+                                    "openapi-mcp-generator failed for {}. Skipping server launch.", server_name);
+                                continue; 
+                            }
+                            tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "openapi-mcp-generator completed successfully.");
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to execute openapi-mcp-generator. Skipping server launch.");
+                            continue;
+                        }
+                    }
+                }
+                
+                // Fix permissions on the generated directory to ensure npm can write to it
+                let chmod_command = if use_sudo {
+                    format!("sudo chmod -R 777 {}", dedicated_project_path.to_string_lossy())
+                } else {
+                    format!("chmod -R 777 {}", dedicated_project_path.to_string_lossy())
+                };
+                
+                tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, path = %dedicated_project_path.display(), command = %chmod_command, "Setting permissions on generated MCP server directory...");
+                let chmod_status = Command::new("bash")
+                    .arg("-c")
+                    .arg(&chmod_command)
+                    .status()
+                    .await;
+                match chmod_status {
+                    Ok(status) if status.success() => {
+                        tracing::info!(target: "dev_runtime::mcp_server", server_name = %server_name, "Permissions set successfully.");
+                    }
+                    Ok(status) => {
+                        tracing::warn!(target: "dev_runtime::mcp_server", server_name = %server_name, status = %status, "Failed to set permissions, but continuing anyway.");
                     }
                     Err(e) => {
-                        tracing::error!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to execute openapi-mcp-generator. Skipping server launch.");
-                        continue;
+                        tracing::warn!(target: "dev_runtime::mcp_server", server_name = %server_name, error = ?e, "Failed to execute chmod command, but continuing anyway.");
                     }
                 }
             }
@@ -159,24 +234,41 @@ pub async fn create_mcp_servers() -> Result<Vec<McpServiceDefinition>> {
             let server_id_clone = server_id.clone();
             let server_name_clone = server_name.clone();
             let assigned_port_clone = assigned_port;
+            let use_sudo_clone = use_sudo;
             tokio::spawn(async move {
                 let proj_path = dedicated_project_path_clone;
                 let s_id = server_id_clone;
                 let s_name = server_name_clone;
 
-                tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm install...");
-                if let Err(e) = npm::run_npm_command(&proj_path, &["install"], false).await {
-                    tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm install failed. Aborting launch for this server.");
-                    return;
-                }
-                tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm install completed.");
+                if use_sudo_clone {
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm install with sudo...");
+                    if let Err(e) = npm::run_npm_command_with_sudo(&proj_path, &["install"], false).await {
+                        tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm install with sudo failed. Aborting launch for this server.");
+                        return;
+                    }
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm install completed.");
 
-                tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm run build...");
-                if let Err(e) = npm::run_npm_command(&proj_path, &["run", "build"], false).await {
-                    tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm run build failed. Aborting launch for this server.");
-                    return; 
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm run build with sudo...");
+                    if let Err(e) = npm::run_npm_command_with_sudo(&proj_path, &["run", "build"], false).await {
+                        tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm run build with sudo failed. Aborting launch for this server.");
+                        return; 
+                    }
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm run build completed.");
+                } else {
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm install...");
+                    if let Err(e) = npm::run_npm_command(&proj_path, &["install"], false).await {
+                        tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm install failed. Aborting launch for this server.");
+                        return;
+                    }
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm install completed.");
+
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), "Running npm run build...");
+                    if let Err(e) = npm::run_npm_command(&proj_path, &["run", "build"], false).await {
+                        tracing::error!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, error = ?e, "npm run build failed. Aborting launch for this server.");
+                        return; 
+                    }
+                    tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm run build completed.");
                 }
-                tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, "npm run build completed.");
 
                 tracing::info!(target: "dev_runtime::mcp_server::lifecycle", server_id = %s_id, server_name = %s_name, path = %proj_path.display(), port = assigned_port_clone, "Running npm run start:http...");
                 if let Err(e) = util::spawn_background_command_in_dir(&proj_path, "npm", &["run", "start:http"], &format!("MCP Server {} ({})", s_name, s_id), None).await {

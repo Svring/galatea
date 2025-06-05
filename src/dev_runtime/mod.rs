@@ -1,9 +1,9 @@
-pub mod nextjs_dev_server;
-pub mod lsp_client;
 pub mod log;
+pub mod lsp_client;
 pub mod mcp_server;
-pub mod util;
+pub mod nextjs_dev_server;
 pub mod types;
+pub mod util;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use types::McpServiceDefinition;
 pub async fn launch_runtime_services(
     project_dir: PathBuf, // The root directory of the Next.js project
     mcp_enabled: bool,
+    use_sudo: bool,
 ) -> Result<Vec<McpServiceDefinition>> {
     tracing::info!(target: "dev_runtime", "Starting runtime services...");
 
@@ -41,9 +42,9 @@ pub async fn launch_runtime_services(
 
     if mcp_enabled {
         tracing::info!(target: "dev_runtime", "MCP flag is enabled. Attempting to launch MCP servers...");
-        
+
         // Ensure openapi-mcp-generator is installed
-        match crate::dev_setup::mcp_converter::ensure_openapi_mcp_generator_installed().await {
+        match crate::dev_setup::mcp_converter::ensure_openapi_mcp_generator_installed(use_sudo).await {
             Ok(_) => {
                 tracing::info!(target: "dev_runtime", "openapi-mcp-generator is available.");
             }
@@ -52,9 +53,9 @@ pub async fn launch_runtime_services(
                 return Err(e).context("Failed to ensure openapi-mcp-generator is installed");
             }
         }
-        
+
         // Await MCP server creation to get their definitions
-        match mcp_server::create_mcp_servers().await {
+        match mcp_server::create_mcp_servers(use_sudo).await {
             Ok(definitions) => {
                 tracing::info!(target: "dev_runtime", count = definitions.len(), "MCP server creation process completed.");
                 mcp_definitions = definitions;

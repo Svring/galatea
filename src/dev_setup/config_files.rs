@@ -57,14 +57,14 @@ pub fn create_galatea_files_folder() -> Result<PathBuf> {
 fn write_openapi_spec_files(openapi_dir: &Path) -> Result<()> {
     // Project API
     let project_api_service = OpenApiService::new(ProjectApi, "Project API", "1.0")
-        .server("http://localhost:3051/api/project");
+        .server("http://127.0.0.1:3051/api/project");
     let project_spec = project_api_service.spec();
     fs::write(openapi_dir.join("project_api.json"), project_spec)
         .context("Failed to write project_api.json")?;
 
     // Editor API
     let editor_api_service = OpenApiService::new(EditorApi, "Editor API", "1.0")
-        .server("http://localhost:3051/api/editor");
+        .server("http://127.0.0.1:3051/api/editor");
     let editor_spec = editor_api_service.spec();
     fs::write(openapi_dir.join("editor_api.json"), editor_spec)
         .context("Failed to write editor_api.json")?;
