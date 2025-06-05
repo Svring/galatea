@@ -3,10 +3,11 @@ use std::fs;
 use std::process::Stdio;
 use tokio::process::Command;
 use tracing;
-use crate::terminal::port::is_port_available;
+use crate::terminal::port::{is_port_available, ensure_port_is_free};
 use crate::dev_runtime::util; // Still needed for spawn_background_command_in_dir
 use crate::terminal::npm; // Import the npm module
 use crate::dev_runtime::types::McpServiceDefinition; // Import the definition
+use tokio::time::{timeout, Duration};
 
 const STARTING_MCP_PORT: u16 = 3060;
 const MCP_OPENAPI_SPEC_PATH: &str = "/openapi.json"; // Assumed path on the MCP server
@@ -27,6 +28,61 @@ pub async fn create_mcp_servers(use_sudo: bool) -> Result<Vec<McpServiceDefiniti
         tracing::warn!(target: "dev_runtime::mcp_server", path = %openapi_spec_dir.display(), "OpenAPI specification directory not found. Skipping MCP server launch.");
         return Ok(Vec::new()); // Return empty list if no dir
     }
+
+    // Count how many OpenAPI specs we have to determine how many ports we need
+    let spec_count = fs::read_dir(&openapi_spec_dir)
+        .context(format!("Failed to read OpenAPI specification directory at {}", openapi_spec_dir.display()))?
+        .filter_map(|entry| {
+            entry.ok().and_then(|e| {
+                let path = e.path();
+                if path.is_file() {
+                    let extension = path.extension().and_then(|s| s.to_str());
+                    if extension == Some("json") || extension == Some("yaml") || extension == Some("yml") {
+                        Some(())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+        .count();
+
+    if spec_count == 0 {
+        tracing::info!(target: "dev_runtime::mcp_server", "No valid OpenAPI specifications found. Skipping MCP server launch.");
+        return Ok(Vec::new());
+    }
+
+    // Only clean up the ports we actually need, plus a small buffer
+    let ports_to_clean = std::cmp::min(spec_count + 2, 10); // Clean at most 10 ports
+    tracing::info!(target: "dev_runtime::mcp_server", "Found {} OpenAPI specs. Cleaning up {} ports ({}-{}) before launching servers...", 
+        spec_count, ports_to_clean, STARTING_MCP_PORT, STARTING_MCP_PORT + ports_to_clean as u16 - 1);
+    
+    for i in 0..ports_to_clean {
+        let port = STARTING_MCP_PORT + i as u16;
+        
+        // Quick check: if port is already available, skip cleanup
+        if is_port_available(port).await {
+            tracing::debug!(target: "dev_runtime::mcp_server", port, "Port already available, skipping cleanup.");
+            continue;
+        }
+        
+        // Port is in use, try to free it with a shorter timeout
+        let cleanup_result = timeout(Duration::from_millis(1500), ensure_port_is_free(port, "MCP server pre-launch cleanup")).await;
+        match cleanup_result {
+            Ok(Ok(_)) => {
+                tracing::debug!(target: "dev_runtime::mcp_server", port, "Port successfully freed.");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target: "dev_runtime::mcp_server", port, error = ?e, "Failed to ensure port is free during MCP pre-launch cleanup. Continuing anyway.");
+            }
+            Err(_) => {
+                tracing::warn!(target: "dev_runtime::mcp_server", port, "Timeout while trying to free port during MCP pre-launch cleanup. Continuing anyway.");
+            }
+        }
+    }
+    tracing::info!(target: "dev_runtime::mcp_server", "MCP port range cleanup complete.");
 
     if !mcp_servers_base_dir.exists() {
         fs::create_dir_all(&mcp_servers_base_dir)
@@ -75,8 +131,8 @@ pub async fn create_mcp_servers(use_sudo: bool) -> Result<Vec<McpServiceDefiniti
                 }
                 tracing::warn!(target: "dev_runtime::mcp_server", port = current_port, "Port already in use, trying next.");
                 current_port += 1;
-                if current_port > STARTING_MCP_PORT + 100 { // Safety break
-                    let err_msg = format!("Could not find an available port after 100 attempts for MCP server {}", server_name);
+                if current_port > STARTING_MCP_PORT + 50 { // Reduced safety break
+                    let err_msg = format!("Could not find an available port after 50 attempts for MCP server {}", server_name);
                     tracing::error!(target: "dev_runtime::mcp_server", "{}", err_msg);
                     return Err(anyhow::anyhow!(err_msg)); 
                 }
